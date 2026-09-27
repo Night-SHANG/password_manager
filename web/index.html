@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>密码管理器</title>
+    <script src="js/tailwind.js"></script>
+    <link rel="stylesheet" href="css/style.css">
+    <!-- SortableJS 拖拽排序 -->
+    <script src="js/sortable.min.js"></script>
+</head>
+<body class="bg-gray-50 text-gray-800 h-screen overflow-hidden flex font-sans">
+    
+    <!-- 侧边栏 -->
+    <aside class="w-64 bg-white border-r border-gray-200 flex flex-col h-full flex-shrink-0 shadow-sm z-10">
+        <!-- Logo区 -->
+        <div class="h-16 flex items-center px-6 border-b border-gray-200 bg-gray-50">
+            <span class="text-2xl mr-3">🔐</span>
+            <h1 class="text-lg font-bold text-gray-800">密码管理器</h1>
+        </div>
+
+        <!-- 分类列表区域 -->
+        <div class="flex-1 overflow-y-auto py-4 px-3 custom-scrollbar" id="category-container">
+            <!-- 固定分类 -->
+            <ul class="space-y-1 mb-4" id="fixed-categories">
+                <li class="category-item">
+                    <button class="category-btn active w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-gray-600 hover:bg-gray-100 hover:text-gray-900 transition-colors" data-category="全部">
+                        <div class="flex items-center"><span class="mr-2 w-6 text-center">📁</span><span class="truncate max-w-[100px]">全部</span></div>
+                        <div class="flex items-center">
+                            <span class="text-xs bg-gray-100 border border-gray-200 text-gray-500 px-2 py-0.5 rounded-full count-badge" id="count-全部">0</span>
+                        </div>
+                    </button>
+                </li>
+                <li class="category-item">
+                    <button class="category-btn w-full flex items-center justify-between px-3 py-2 rounded-md text-sm text-gray-600 hover:bg-gray-100 hover:text-gray-900 transition-colors" data-category="收藏">
+                        <div class="flex items-center"><span class="mr-2 w-6 text-center">📁</span><span class="truncate max-w-[100px]">收藏</span></div>
+                        <div class="flex items-center">
+                            <span class="text-xs bg-gray-100 border border-gray-200 text-gray-500 px-2 py-0.5 rounded-full count-badge" id="count-收藏">0</span>
+                        </div>
+                    </button>
+                </li>
+                <div id="other-category-container" class="contents">
+                    <!-- 动态渲染'其他' -->
+                </div>
+            </ul>
+
+            <div class="h-px bg-gray-200 my-3 mx-2"></div>
+
+            <!-- 可拖拽的自定义分类 -->
+            <ul class="space-y-1" id="custom-categories">
+                <!-- 动态渲染 -->
+            </ul>
+        </div>
+
+        <!-- 底部工具栏 -->
+        <div class="p-4 border-t border-gray-200 space-y-2 bg-gray-50">
+            <button id="add-category-btn" class="w-full text-left px-3 py-2 text-sm text-blue-600 font-medium hover:bg-blue-50 rounded-md transition-colors flex items-center mb-2">
+                <span class="mr-2 text-lg leading-none">+</span> 添加新分类
+            </button>
+            <div class="h-px bg-gray-200 w-full my-2"></div>
+            <button id="import-btn" class="w-full text-left px-3 py-2 text-sm text-gray-600 hover:text-gray-900 hover:bg-gray-200 rounded-md transition-colors flex items-center">
+                <span class="mr-2">📥</span> 导入数据
+            </button>
+            <button id="export-btn" class="w-full text-left px-3 py-2 text-sm text-gray-600 hover:text-gray-900 hover:bg-gray-200 rounded-md transition-colors flex items-center">
+                <span class="mr-2">📤</span> 导出数据
+            </button>
+        </div>
+    </aside>
+
+    <!-- 主内容区 -->
+    <main class="flex-1 flex flex-col h-full bg-gray-50">
+        <!-- 顶部操作栏 -->
+        <header class="h-16 px-8 flex items-center gap-4 border-b border-gray-200 bg-white shadow-sm flex-shrink-0 z-0">
+            <div class="relative flex-1">
+                <span class="absolute inset-y-0 left-0 flex items-center pl-3 text-gray-400">🔍</span>
+                <input type="text" id="search-input" placeholder="搜索密码..." class="w-full bg-gray-50 border border-gray-300 rounded-lg py-2 pl-10 pr-10 text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all">
+                <!-- 清空按钮 -->
+                <button id="clear-search-btn" class="absolute inset-y-0 right-0 flex items-center pr-3 text-gray-400 hover:text-gray-600 hidden">
+                    ✕
+                </button>
+            </div>
+            <button id="add-entry-btn" class="bg-blue-600 hover:bg-blue-700 text-white px-5 py-2 rounded-lg text-sm font-medium transition-colors shadow-sm flex items-center whitespace-nowrap flex-shrink-0">
+                <span class="mr-1 text-lg leading-none">+</span> 添加密码
+            </button>
+        </header>
+
+        <!-- 密码卡片列表 (无缝滚动区域) -->
+        <div class="flex-1 overflow-y-auto p-8 custom-scrollbar relative" id="entries-container">
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6 content-start" id="cards-grid">
+                <!-- 动态渲染卡片 -->
+            </div>
+            
+            <!-- 空状态提示 -->
+            <div id="empty-state" class="hidden absolute inset-0 flex flex-col items-center justify-center text-gray-400">
+                <span class="text-5xl mb-4">📭</span>
+                <p class="text-lg">没有找到相关密码</p>
+            </div>
+        </div>
+    </main>
+
+    <!-- 弹窗模态框容器 -->
+    <div id="modal-container" class="fixed inset-0 bg-gray-900 bg-opacity-50 hidden items-center justify-center z-50 backdrop-blur-sm">
+        <!-- 动态注入弹窗内容 -->
+    </div>
+
+    <!-- 提示框 Toast -->
+    <div id="toast" class="fixed bottom-6 right-6 transform translate-y-20 opacity-0 transition-all duration-300 z-50">
+        <div class="bg-gray-800 text-white px-5 py-3 rounded-lg shadow-xl flex items-center text-sm font-medium">
+            <span id="toast-icon" class="mr-3">✔</span>
+            <span id="toast-msg">操作成功</span>
+        </div>
+    </div>
+
+    <!-- 登录/初始化全屏遮罩 -->
+    <div id="auth-screen" class="fixed inset-0 bg-gray-50 z-50 flex items-center justify-center">
+        <div class="bg-white p-10 rounded-2xl shadow-2xl border border-gray-100 w-[400px] text-center">
+            <div class="text-6xl mb-6 drop-shadow-md">🔐</div>
+            <h2 id="auth-title" class="text-2xl font-bold text-gray-800 mb-2">解锁密码库</h2>
+            <p id="auth-subtitle" class="text-gray-500 text-sm mb-8">请输入主密码以解密数据</p>
+            
+            <input type="password" id="auth-password" autofocus class="w-full bg-gray-50 border border-gray-300 rounded-lg p-3 text-gray-800 mb-6 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-center text-xl tracking-widest shadow-inner" placeholder="••••••••">
+            
+            <button id="auth-btn" class="w-full bg-blue-600 hover:bg-blue-700 shadow-md shadow-blue-200 text-white font-bold py-3.5 rounded-lg transition-all active:scale-[0.98]">
+                解 锁
+            </button>
+            <p id="auth-error" class="text-red-500 text-sm mt-4 hidden font-medium">密码错误，请重试</p>
+        </div>
+    </div>
+
+    <script src="js/app.js"></script>
+</body>
+</html>

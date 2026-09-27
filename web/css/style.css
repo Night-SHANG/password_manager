@@ -1,0 +1,67 @@
+/* 自定义滚动条 - 浅色风格 */
+.custom-scrollbar::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+    background: #cbd5e1; /* gray-300 */
+    border-radius: 4px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: #94a3b8; /* gray-400 */
+}
+
+/* 卡片拖拽动画 */
+.sortable-ghost {
+    opacity: 0.4;
+    background-color: #f1f5f9; /* slate-100 */
+    border: 2px dashed #cbd5e1;
+}
+
+/* 分类选中高亮 */
+.category-btn.active {
+    background-color: #eff6ff; /* blue-50 */
+    color: #1d4ed8; /* blue-700 */
+    font-weight: 500;
+}
+.category-btn.active .count-badge {
+    background-color: #dbeafe; /* blue-100 */
+    color: #1e3a8a; /* blue-900 */
+    border-color: #bfdbfe;
+}
+
+/* 密码文本模糊滤镜，防止别人偷看 */
+.blur-text {
+    filter: blur(4px);
+    transition: filter 0.2s ease;
+    cursor: pointer;
+    user-select: none;
+}
+.blur-text:hover {
+    filter: blur(0);
+}
+
+/* 删除按钮只在Hover时显示 */
+.category-item .delete-btn {
+    opacity: 0;
+    transition: opacity 0.2s ease;
+}
+.category-item:hover .delete-btn {
+    opacity: 1;
+}
+
+/* 卡片过渡效果 */
+.password-card {
+    transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+.password-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05), 0 4px 6px -2px rgba(0, 0, 0, 0.025);
+    border-color: #cbd5e1; /* gray-300 */
+}
