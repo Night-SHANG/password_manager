@@ -89,7 +89,9 @@ impl VaultSession {
         let verification: VaultFile = serde_json::from_slice(&bytes)?;
         let verified_body = decode_body(&verification, &keys)?;
         if verified_body != body {
-            return Err(AppError::InvalidVault("initial vault verification mismatch"));
+            return Err(AppError::InvalidVault(
+                "initial vault verification mismatch",
+            ));
         }
 
         let temp = temp_path_for(&path);
@@ -122,7 +124,9 @@ impl VaultSession {
 
         if unwrapped.len() != 32 {
             unwrapped.zeroize();
-            return Err(AppError::InvalidVault("wrapped vault key length is invalid"));
+            return Err(AppError::InvalidVault(
+                "wrapped vault key length is invalid",
+            ));
         }
 
         let mut vault_key = [0u8; 32];
@@ -324,12 +328,7 @@ fn entry_aad(vault_id: Uuid, entry_id: Uuid) -> Vec<u8> {
 fn encode_file(header: &PublicHeader, body: &VaultBody, keys: &VaultKeys) -> Result<Vec<u8>> {
     let nonce = random_array::<NONCE_LEN>()?;
     let mut plaintext = serde_json::to_vec(body)?;
-    let ciphertext = seal(
-        &keys.vault_key,
-        &nonce,
-        &body_aad(header),
-        &plaintext,
-    )?;
+    let ciphertext = seal(&keys.vault_key, &nonce, &body_aad(header), &plaintext)?;
     plaintext.zeroize();
 
     serde_json::to_vec(&VaultFile {

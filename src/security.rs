@@ -1,7 +1,7 @@
 use argon2::{Algorithm, Argon2, Params as Argon2Params, Version};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
     Key, XChaCha20Poly1305, XNonce,
+    aead::{Aead, KeyInit, Payload},
 };
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
@@ -72,11 +72,7 @@ pub fn random_array<const N: usize>() -> Result<[u8; N]> {
     Ok(out)
 }
 
-pub fn derive_kek(
-    master_password: &str,
-    salt: &[u8],
-    config: KdfConfig,
-) -> Result<[u8; KEY_LEN]> {
+pub fn derive_kek(master_password: &str, salt: &[u8], config: KdfConfig) -> Result<[u8; KEY_LEN]> {
     let config = config.validate()?;
     if salt.len() < SALT_LEN {
         return Err(AppError::InvalidVault("KDF salt is too short"));

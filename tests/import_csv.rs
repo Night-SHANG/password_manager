@@ -12,14 +12,12 @@ fn chrome_reimport_is_stable_at_normalization_layer() {
 
 #[test]
 fn changed_password_changes_fingerprint() {
-    let old = parse_reader(
-        "name,url,username,password\nGitHub,https://github.com,ada,old\n".as_bytes(),
-    )
-    .unwrap();
-    let new = parse_reader(
-        "name,url,username,password\nGitHub,https://github.com,ada,new\n".as_bytes(),
-    )
-    .unwrap();
+    let old =
+        parse_reader("name,url,username,password\nGitHub,https://github.com,ada,old\n".as_bytes())
+            .unwrap();
+    let new =
+        parse_reader("name,url,username,password\nGitHub,https://github.com,ada,new\n".as_bytes())
+            .unwrap();
 
     assert_ne!(old.items[0].fingerprint, new.items[0].fingerprint);
 }

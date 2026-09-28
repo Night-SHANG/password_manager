@@ -2,7 +2,7 @@
 name = "password-manager"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 publish = false
 description = "Local-first encrypted password manager for Windows"
 

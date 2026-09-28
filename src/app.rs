@@ -82,19 +82,25 @@ impl App {
     }
 
     fn locked_view(&self) -> Element<'_, Message> {
-        let path = text_input("保险库路径，例如 D:\\Passwords\\main.pmvault", &self.vault_path)
-            .on_input(Message::VaultPathChanged)
-            .padding(10);
+        let path = text_input(
+            "保险库路径，例如 D:\\Passwords\\main.pmvault",
+            &self.vault_path,
+        )
+        .on_input(Message::VaultPathChanged)
+        .padding(10);
 
         let password = text_input("主密码", &self.master_password)
             .on_input(Message::MasterPasswordChanged)
             .secure(true)
             .padding(10);
 
-        let confirm = text_input("再次输入主密码（仅创建新保险库时需要）", &self.confirm_password)
-            .on_input(Message::ConfirmPasswordChanged)
-            .secure(true)
-            .padding(10);
+        let confirm = text_input(
+            "再次输入主密码（仅创建新保险库时需要）",
+            &self.confirm_password,
+        )
+        .on_input(Message::ConfirmPasswordChanged)
+        .secure(true)
+        .padding(10);
 
         let content = column![
             text("密码管理器").size(36),
@@ -190,9 +196,7 @@ impl App {
                 container(scrollable(list))
                     .padding(16)
                     .width(Length::FillPortion(2)),
-                container(details)
-                    .padding(16)
-                    .width(Length::FillPortion(3)),
+                container(details).padding(16).width(Length::FillPortion(3)),
             ]
             .height(Length::Fill),
             text(&self.status)

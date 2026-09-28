@@ -3,8 +3,8 @@
 use std::path::Path;
 
 use windows::Win32::Storage::FileSystem::{
-    MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    REPLACEFILE_WRITE_THROUGH,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH,
+    ReplaceFileW,
 };
 use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
 use windows::core::PCWSTR;
@@ -33,8 +33,7 @@ pub fn atomic_replace(target: &Path, replacement: &Path, backup: Option<&Path>) 
 
         if let Some(path) = backup {
             if path.exists() {
-                std::fs::remove_file(path)
-                    .map_err(|e| AppError::io(path.to_path_buf(), e))?;
+                std::fs::remove_file(path).map_err(|e| AppError::io(path.to_path_buf(), e))?;
             }
         }
 

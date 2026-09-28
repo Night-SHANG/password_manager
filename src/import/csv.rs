@@ -45,7 +45,13 @@ const ALIASES: &[(LogicalField, &[&str])] = &[
     ),
     (
         LogicalField::Password,
-        &["password", "login password", "login_password", "pwd", "passwd"],
+        &[
+            "password",
+            "login password",
+            "login_password",
+            "pwd",
+            "passwd",
+        ],
     ),
     (
         LogicalField::Notes,
@@ -74,11 +80,9 @@ impl Mapping {
 
         for (field, aliases) in ALIASES {
             for alias in *aliases {
-                if let Some((index, _)) = normalized
-                    .iter()
-                    .enumerate()
-                    .find(|(index, header)| !claimed[*index] && header.as_str() == normalize_header(alias))
-                {
+                if let Some((index, _)) = normalized.iter().enumerate().find(|(index, header)| {
+                    !claimed[*index] && header.as_str() == normalize_header(alias)
+                }) {
                     columns.insert(*field, index);
                     claimed[index] = true;
                     break;
@@ -118,17 +122,13 @@ fn normalize_header(value: &str) -> String {
 fn provider_from_headers(headers: &csv::StringRecord) -> &'static str {
     let fields: Vec<String> = headers.iter().map(normalize_header).collect();
 
-    if fields.iter().any(|v| v == "login uri")
-        && fields.iter().any(|v| v == "login password")
-    {
+    if fields.iter().any(|v| v == "login uri") && fields.iter().any(|v| v == "login password") {
         "bitwarden"
     } else if fields.iter().any(|v| v == "formactionorigin")
         || fields.iter().any(|v| v == "httprealm")
     {
         "firefox"
-    } else if fields.iter().any(|v| v == "group")
-        && fields.iter().any(|v| v == "title")
-    {
+    } else if fields.iter().any(|v| v == "group") && fields.iter().any(|v| v == "title") {
         "keepass-compatible"
     } else {
         "chrome-compatible"
@@ -172,9 +172,7 @@ fn fingerprint(
 }
 
 pub fn parse_reader<R: Read>(reader: R) -> Result<ImportParseResult> {
-    let mut csv = csv::ReaderBuilder::new()
-        .flexible(true)
-        .from_reader(reader);
+    let mut csv = csv::ReaderBuilder::new().flexible(true).from_reader(reader);
 
     let headers = csv.headers()?.clone();
     let mapping = Mapping::from_headers(&headers);
