@@ -34,3 +34,23 @@ Formal development happens on `dev/rust-rewrite-v1`.
 The Python implementation currently kept in this branch is legacy reference material only. The Rust code under `src/` is the new authority.
 
 The repository Preflight checks formatting, compilation, tests, Clippy, lockfile state, and forbidden tracked files. Synthetic fixtures are generated during tests; real vaults, databases, and password exports must never be committed.
+
+
+## Desktop UI status
+
+The Iced desktop UI is connected directly to the encrypted vault and currently includes:
+
+- create / unlock / lock
+- three-column navigation, search, categories, favorites, recycle bin
+- add and edit login entries
+- password hidden by default, explicit reveal and copy
+- OS-CSPRNG password generation
+- safe HTTP/HTTPS website opening through the system browser
+- encrypted recycle-bin restore and confirmed permanent deletion
+- import Preview with update/conflict/locally-deleted decisions
+- encrypted backup creation and transactional restore
+- explicit-risk plaintext CSV export
+- dark/light appearance toggle
+- keyboard shortcuts: Ctrl/Cmd+F, N, S, L
+
+Windows session auto-lock, screenshot exclusion, and conditional clipboard timeout clearing belong to the Windows lifecycle batch and are intentionally not duplicated in the generic UI layer.

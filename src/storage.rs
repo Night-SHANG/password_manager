@@ -164,6 +164,14 @@ impl VaultSession {
         &self.body.entries
     }
 
+    pub fn categories(&self) -> &[String] {
+        &self.body.categories
+    }
+
+    pub fn entry(&self, id: Uuid) -> Option<&EntryRecord> {
+        self.body.entries.iter().find(|entry| entry.id == id)
+    }
+
     pub fn active_entries(&self) -> impl Iterator<Item = &EntryRecord> {
         self.body.entries.iter().filter(|entry| !entry.is_deleted())
     }
@@ -224,6 +232,18 @@ impl VaultSession {
         self.open_secret(entry)
     }
 
+    pub fn set_favorite(&mut self, id: Uuid, favorite: bool) -> Result<()> {
+        let entry = self
+            .body
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| AppError::Input("找不到该条目".to_string()))?;
+        entry.favorite = favorite;
+        entry.updated_at_unix = now_unix();
+        Ok(())
+    }
+
     pub fn move_to_recycle_bin(&mut self, id: Uuid) -> Result<()> {
         let now = now_unix();
         let entry = self
@@ -247,6 +267,19 @@ impl VaultSession {
             .ok_or_else(|| AppError::Input("找不到该条目".to_string()))?;
         entry.deleted_at_unix = None;
         entry.updated_at_unix = now;
+        Ok(())
+    }
+
+    pub fn permanently_delete(&mut self, id: Uuid) -> Result<()> {
+        let index = self
+            .body
+            .entries
+            .iter()
+            .position(|entry| entry.id == id && entry.is_deleted())
+            .ok_or_else(|| {
+                AppError::Input("只能永久删除回收站中的条目".to_string())
+            })?;
+        self.body.entries.remove(index);
         Ok(())
     }
 
