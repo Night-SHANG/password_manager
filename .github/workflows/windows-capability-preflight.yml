@@ -1,0 +1,43 @@
+name: Windows Capability Preflight
+
+on:
+  push:
+    branches:
+      - preflight/windows-capabilities
+    paths:
+      - "preflight/windows-capabilities/**"
+      - ".github/workflows/windows-capability-preflight.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-capabilities:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: preflight/windows-capabilities
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: preflight/windows-capabilities
+
+      - name: Check all probe targets
+        run: cargo check --all-targets --locked
+
+      - name: Verify Iced to HWND bridge
+        run: cargo run --release --locked --bin iced-hwnd-probe
+
+      - name: Run Windows runtime probes
+        run: cargo run --release --locked --bin windows-probe
