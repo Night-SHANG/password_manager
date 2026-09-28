@@ -1,5 +1,5 @@
 use iced::{Task, window};
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use raw_window_handle::RawWindowHandle;
 
 fn get_windows_hwnd(id: window::Id) -> Task<Option<isize>> {
     window::run(id, |managed_window| {
