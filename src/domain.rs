@@ -9,6 +9,8 @@ pub struct VaultBody {
     pub schema_version: u32,
     pub entries: Vec<EntryRecord>,
     pub categories: Vec<String>,
+    #[serde(default)]
+    pub import_history: Vec<ImportSourceRecord>,
 }
 
 impl Default for VaultBody {
@@ -17,6 +19,7 @@ impl Default for VaultBody {
             schema_version: BODY_SCHEMA_VERSION,
             entries: Vec::new(),
             categories: vec!["其他".to_string()],
+            import_history: Vec::new(),
         }
     }
 }
@@ -69,6 +72,16 @@ pub struct ImportProvenance {
     pub source_stable_id: Option<String>,
     pub last_import_fingerprint: [u8; 32],
     pub last_imported_at_unix: u64,
+    #[serde(default)]
+    pub source_digest: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportSourceRecord {
+    pub provider: String,
+    pub source_digest: [u8; 32],
+    pub imported_at_unix: u64,
+    pub source_item_count: u64,
 }
 
 #[derive(Debug)]

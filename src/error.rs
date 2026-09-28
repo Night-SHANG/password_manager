@@ -39,6 +39,9 @@ pub enum AppError {
     #[error("target vault already exists")]
     AlreadyExists,
 
+    #[error("migration failed: {0}")]
+    Migration(String),
+
     #[error("input error: {0}")]
     Input(String),
 
@@ -52,6 +55,10 @@ impl AppError {
             path: path.into(),
             source,
         }
+    }
+
+    pub fn migration(error: impl std::fmt::Display) -> Self {
+        Self::Migration(error.to_string())
     }
 }
 
