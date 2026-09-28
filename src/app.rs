@@ -523,8 +523,7 @@ impl App {
                 }
                 SecurityEvent::MonitorFailed => {
                     self.security_monitor_ready = false;
-                    self.status =
-                        "Windows 会话安全监控启动失败；锁屏/挂起自动锁不可用".to_string();
+                    self.status = "Windows 会话安全监控启动失败；锁屏/挂起自动锁不可用".to_string();
                 }
                 SecurityEvent::SessionLocked => {
                     self.lock_with_status("检测到 Windows 锁屏，保险库已自动锁定");
@@ -536,24 +535,19 @@ impl App {
                     self.lock_with_status("检测到系统挂起，保险库已自动锁定");
                 }
                 SecurityEvent::ClipboardCleanupFailed => {
-                    self.status =
-                        "剪贴板自动清理失败；请手动覆盖或清空剪贴板".to_string();
+                    self.status = "剪贴板自动清理失败；请手动覆盖或清空剪贴板".to_string();
                 }
             },
             Message::PasswordClipboardWritten(success) => {
                 if success {
                     let sequence = platform::clipboard_sequence_number();
-                    match platform::arm_clipboard_clear(
-                        sequence,
-                        PASSWORD_CLIPBOARD_TIMEOUT_MS,
-                    ) {
+                    match platform::arm_clipboard_clear(sequence, PASSWORD_CLIPBOARD_TIMEOUT_MS) {
                         Ok(()) => {
                             self.status =
                                 "密码已复制；30 秒后仅在剪贴板未被改动时自动清除".to_string();
                         }
                         Err(error) => {
-                            self.status =
-                                format!("密码已复制，但自动清理未启用：{error}");
+                            self.status = format!("密码已复制，但自动清理未启用：{error}");
                         }
                     }
                 } else {

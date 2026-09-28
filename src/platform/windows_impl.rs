@@ -25,8 +25,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, PBT_APMSUSPEND,
     PostMessageW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowDisplayAffinity,
     TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WINDOW_EX_STYLE, WM_APP, WM_DESTROY,
-    WM_POWERBROADCAST, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_OVERLAPPED,
-    WTS_SESSION_LOCK, WTS_SESSION_LOGOFF,
+    WM_POWERBROADCAST, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_OVERLAPPED, WTS_SESSION_LOCK,
+    WTS_SESSION_LOGOFF,
 };
 use windows::core::{PCWSTR, w};
 
