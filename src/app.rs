@@ -9,7 +9,7 @@ use iced::{Element, Length, Subscription, Task, Theme, clipboard, keyboard};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::domain::{EntryDraft, EntryRecord};
+use crate::domain::EntryRecord;
 use crate::export::{PlaintextExportAcknowledgement, export_plaintext_csv};
 use crate::import::plan::{
     ConflictResolution, ImportApplyOptions, ImportClass, ImportPreview, apply_preview,
@@ -375,7 +375,7 @@ impl App {
                     match session.reveal_secret(id) {
                         Ok(secret) => {
                             self.status = "密码已复制到系统剪贴板".to_string();
-                            return clipboard::write(secret.password.clone()).discard();
+                            return clipboard::write::<Message>(secret.password.clone()).discard();
                         }
                         Err(error) => self.status = format!("复制失败：{error}"),
                     }
@@ -384,7 +384,7 @@ impl App {
             Message::CopyUsername => {
                 if let Some(username) = self.selected_entry().map(|entry| entry.username.clone()) {
                     self.status = "用户名已复制".to_string();
-                    return clipboard::write(username).discard();
+                    return clipboard::write::<Message>(username).discard();
                 }
             }
             Message::OpenWebsite => self.open_selected_website(),
