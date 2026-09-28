@@ -9,8 +9,8 @@ use password_manager::import::plan::{
 };
 use password_manager::storage::VaultSession;
 use pbkdf2::pbkdf2_hmac_array;
-use sha2::Sha256 as LegacySha256;
 use rusqlite::{Connection, params};
+use sha2::Sha256 as LegacySha256;
 use zeroize::Zeroize;
 
 fn legacy_cipher(master_password: &str, salt: &[u8; 16]) -> Fernet {
