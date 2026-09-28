@@ -222,7 +222,7 @@ enum Message {
     ScreenCaptureProtectionChanged(bool),
     ScreenCaptureProtectionApplied(std::result::Result<bool, String>),
     PlatformSecurity(SecurityEvent),
-    PasswordClipboardWritten(bool),
+    PasswordClipboardWritten,
 }
 
 impl App {
@@ -401,11 +401,8 @@ impl App {
                     match session.reveal_secret(id) {
                         Ok(secret) => {
                             self.status = "正在复制密码…".to_string();
-                            return clipboard::write(secret.password.clone()).map(
-                                |result: std::result::Result<(), iced::clipboard::Error>| {
-                                    Message::PasswordClipboardWritten(result.is_ok())
-                                },
-                            );
+                            return clipboard::write::<Message>(secret.password.clone())
+                                .chain(Task::done(Message::PasswordClipboardWritten));
                         }
                         Err(error) => self.status = format!("复制失败：{error}"),
                     }
@@ -541,20 +538,16 @@ impl App {
                     self.status = "剪贴板自动清理失败；请手动覆盖或清空剪贴板".to_string();
                 }
             },
-            Message::PasswordClipboardWritten(success) => {
-                if success {
-                    let sequence = platform::clipboard_sequence_number();
-                    match platform::arm_clipboard_clear(sequence, PASSWORD_CLIPBOARD_TIMEOUT_MS) {
-                        Ok(()) => {
-                            self.status =
-                                "密码已复制；30 秒后仅在剪贴板未被改动时自动清除".to_string();
-                        }
-                        Err(error) => {
-                            self.status = format!("密码已复制，但自动清理未启用：{error}");
-                        }
+            Message::PasswordClipboardWritten => {
+                let sequence = platform::clipboard_sequence_number();
+                match platform::arm_clipboard_clear(sequence, PASSWORD_CLIPBOARD_TIMEOUT_MS) {
+                    Ok(()) => {
+                        self.status =
+                            "密码已复制；30 秒后仅在剪贴板未被改动时自动清除".to_string();
                     }
-                } else {
-                    self.status = "密码复制失败".to_string();
+                    Err(error) => {
+                        self.status = format!("密码已复制，但自动清理未启用：{error}");
+                    }
                 }
             }
         }
