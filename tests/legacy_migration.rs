@@ -8,7 +8,8 @@ use password_manager::import::plan::{
     ImportApplyOptions, ImportClass, apply_preview, build_preview,
 };
 use password_manager::storage::VaultSession;
-use pbkdf2::{pbkdf2_hmac_array, sha2::Sha256 as LegacySha256};
+use pbkdf2::pbkdf2_hmac_array;
+use sha2::Sha256 as LegacySha256;
 use rusqlite::{Connection, params};
 use zeroize::Zeroize;
 

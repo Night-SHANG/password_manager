@@ -6,7 +6,8 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE},
 };
 use fernet::Fernet;
-use pbkdf2::{pbkdf2_hmac_array, sha2::Sha256 as LegacySha256};
+use pbkdf2::pbkdf2_hmac_array;
+use sha2::Sha256 as LegacySha256;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Deserialize;
 use zeroize::Zeroize;
