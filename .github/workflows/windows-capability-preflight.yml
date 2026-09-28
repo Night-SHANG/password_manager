@@ -34,10 +34,10 @@ jobs:
           workspaces: preflight/windows-capabilities
 
       - name: Check all probe targets
-        run: cargo check --all-targets --locked
+        run: cargo check --all-targets
 
       - name: Verify Iced to HWND bridge
-        run: cargo run --release --locked --bin iced-hwnd-probe
+        run: cargo run --release --bin iced-hwnd-probe
 
       - name: Run Windows runtime probes
-        run: cargo run --release --locked --bin windows-probe
+        run: cargo run --release --bin windows-probe
