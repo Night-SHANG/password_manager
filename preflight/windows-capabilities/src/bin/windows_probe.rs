@@ -100,7 +100,7 @@ fn create_probe_window(
     if atom == 0 {
         return Err(io_error(
             "RegisterClassW",
-            windows::core::Error::from_win32(),
+            std::io::Error::last_os_error(),
         )
         .into());
     }
