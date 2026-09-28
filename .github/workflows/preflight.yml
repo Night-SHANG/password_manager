@@ -1,0 +1,85 @@
+name: Rust Preflight
+
+on:
+  push:
+    branches:
+      - dev/rust-rewrite-v1
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "tests/**"
+      - ".github/workflows/preflight.yml"
+      - ".gitignore"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  preflight:
+    runs-on: windows-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Reject forbidden tracked files
+        shell: pwsh
+        run: |
+          $tracked = git ls-files
+          $bad = $tracked | Where-Object {
+            $_ -match '(^|/)(__pycache__)(/|$)' -or
+            $_ -match '\.pyc$' -or
+            $_ -match '(^|/)(passwords\.db|vault\.enc)$' -or
+            $_ -match '\.(db|db-wal|db-shm|pmvault)$'
+          }
+          if ($bad) {
+            Write-Host "Forbidden tracked files:"
+            $bad | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+
+      - name: Bootstrap Cargo.lock
+        shell: pwsh
+        run: cargo generate-lockfile
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Check all targets
+        run: cargo check --all-targets --locked
+
+      - name: Test
+        run: cargo test --all-targets --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Commit Cargo.lock after a green bootstrap
+        if: github.event_name == 'push' && github.ref == 'refs/heads/dev/rust-rewrite-v1'
+        shell: pwsh
+        run: |
+          if (git status --porcelain -- Cargo.lock) {
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.lock
+            git commit -m "build: lock Rust dependencies"
+            git push
+          } else {
+            Write-Host "Cargo.lock already committed."
+          }

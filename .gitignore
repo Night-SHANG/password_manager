@@ -1,0 +1,45 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.tmp
+
+# Password vault / user data
+*.pmvault
+*.pmvault.*
+*.vault
+vault.enc
+passwords.db
+*.db
+*.db-wal
+*.db-shm
+
+# Password exports / backups
+/exports/
+/backups/
+*.backup
+*.bak
+
+# Secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Python legacy cache
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build output
+/build/
+/dist/
+*.exe
+*.msi
+*.log
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
