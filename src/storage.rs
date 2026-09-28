@@ -276,9 +276,7 @@ impl VaultSession {
             .entries
             .iter()
             .position(|entry| entry.id == id && entry.is_deleted())
-            .ok_or_else(|| {
-                AppError::Input("只能永久删除回收站中的条目".to_string())
-            })?;
+            .ok_or_else(|| AppError::Input("只能永久删除回收站中的条目".to_string()))?;
         self.body.entries.remove(index);
         Ok(())
     }

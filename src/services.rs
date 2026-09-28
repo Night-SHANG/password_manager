@@ -30,9 +30,7 @@ impl Default for PasswordGeneratorOptions {
 
 pub fn generate_password(options: PasswordGeneratorOptions) -> Result<String> {
     if !(8..=128).contains(&options.length) {
-        return Err(AppError::Input(
-            "密码长度必须在 8 到 128 之间".to_string(),
-        ));
+        return Err(AppError::Input("密码长度必须在 8 到 128 之间".to_string()));
     }
 
     let mut groups: Vec<&[u8]> = Vec::new();
@@ -49,9 +47,7 @@ pub fn generate_password(options: PasswordGeneratorOptions) -> Result<String> {
         groups.push(SYMBOLS);
     }
     if groups.is_empty() {
-        return Err(AppError::Input(
-            "至少需要启用一种密码字符类型".to_string(),
-        ));
+        return Err(AppError::Input("至少需要启用一种密码字符类型".to_string()));
     }
     if options.length < groups.len() {
         return Err(AppError::Input(
@@ -59,7 +55,10 @@ pub fn generate_password(options: PasswordGeneratorOptions) -> Result<String> {
         ));
     }
 
-    let alphabet: Vec<u8> = groups.iter().flat_map(|group| group.iter().copied()).collect();
+    let alphabet: Vec<u8> = groups
+        .iter()
+        .flat_map(|group| group.iter().copied())
+        .collect();
     let mut output = Vec::with_capacity(options.length);
 
     for group in &groups {
@@ -95,16 +94,16 @@ pub fn safe_web_url(input: &str) -> Result<String> {
 
     let url = match url::Url::parse(trimmed) {
         Ok(url) => url,
-        Err(url::ParseError::RelativeUrlWithoutBase) => url::Url::parse(&format!("https://{trimmed}"))
-            .map_err(|_| AppError::Input("网站地址格式无效".to_string()))?,
+        Err(url::ParseError::RelativeUrlWithoutBase) => {
+            url::Url::parse(&format!("https://{trimmed}"))
+                .map_err(|_| AppError::Input("网站地址格式无效".to_string()))?
+        }
         Err(_) => return Err(AppError::Input("网站地址格式无效".to_string())),
     };
 
     match url.scheme() {
         "http" | "https" => Ok(url.to_string()),
-        _ => Err(AppError::Input(
-            "只允许打开 http / https 网站".to_string(),
-        )),
+        _ => Err(AppError::Input("只允许打开 http / https 网站".to_string())),
     }
 }
 

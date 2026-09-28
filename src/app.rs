@@ -595,7 +595,11 @@ impl App {
         } else {
             for entry in entries {
                 let favorite = if entry.favorite { "★ " } else { "" };
-                let deleted = if entry.is_deleted() { " [回收站]" } else { "" };
+                let deleted = if entry.is_deleted() {
+                    " [回收站]"
+                } else {
+                    ""
+                };
                 let label = column![
                     text(format!("{favorite}{}{}", entry.name, deleted)),
                     text(format!("{}  {}", entry.username, entry.website)).size(12)
@@ -623,7 +627,11 @@ impl App {
                 text(format!(
                     "有效条目：{} · 回收站：{}",
                     session.active_entries().count(),
-                    session.entries().iter().filter(|entry| entry.is_deleted()).count()
+                    session
+                        .entries()
+                        .iter()
+                        .filter(|entry| entry.is_deleted())
+                        .count()
                 )),
             ]
             .spacing(10)
@@ -651,13 +659,20 @@ impl App {
             .spacing(8),
             row![
                 text(format!("密码：{password}")),
-                button(if self.revealed.is_some() { "隐藏" } else { "显示" })
-                    .on_press(Message::ToggleReveal),
+                button(if self.revealed.is_some() {
+                    "隐藏"
+                } else {
+                    "显示"
+                })
+                .on_press(Message::ToggleReveal),
                 button("复制密码").on_press(Message::CopyPassword)
             ]
             .spacing(8),
             text(format!("分类：{}", entry.category)),
-            text(format!("收藏：{}", if entry.favorite { "是" } else { "否" })),
+            text(format!(
+                "收藏：{}",
+                if entry.favorite { "是" } else { "否" }
+            )),
         ]
         .spacing(12);
 
@@ -689,8 +704,12 @@ impl App {
             content = content.push(
                 row![
                     button("编辑").on_press(Message::EditSelected),
-                    button(if entry.favorite { "取消收藏" } else { "收藏" })
-                        .on_press(Message::ToggleSelectedFavorite),
+                    button(if entry.favorite {
+                        "取消收藏"
+                    } else {
+                        "收藏"
+                    })
+                    .on_press(Message::ToggleSelectedFavorite),
                     button("打开网站").on_press(Message::OpenWebsite),
                     button("移到回收站").on_press(Message::MoveSelectedToRecycleBin)
                 ]
@@ -723,8 +742,12 @@ impl App {
                     .on_input(Message::EditorPasswordChanged)
                     .secure(!state.password_visible)
                     .padding(9),
-                button(if state.password_visible { "隐藏" } else { "显示" })
-                    .on_press(Message::ToggleEditorPasswordVisible)
+                button(if state.password_visible {
+                    "隐藏"
+                } else {
+                    "显示"
+                })
+                .on_press(Message::ToggleEditorPasswordVisible)
             ]
             .spacing(8),
             button("生成 20 位安全随机密码").on_press(Message::GeneratePassword),
@@ -816,14 +839,12 @@ impl App {
                     ImportClass::Conflict { existing_ids }
                     | ImportClass::LocallyDeleted { existing_ids } => {
                         attention += 1;
-                        let heading = if matches!(
-                            &row_state.class,
-                            ImportClass::LocallyDeleted { .. }
-                        ) {
-                            "本地已删除"
-                        } else {
-                            "冲突"
-                        };
+                        let heading =
+                            if matches!(&row_state.class, ImportClass::LocallyDeleted { .. }) {
+                                "本地已删除"
+                            } else {
+                                "冲突"
+                            };
                         let selected = state.resolutions.get(&index);
                         let mut block = column![
                             text(format!("{heading}：{}", row_state.item.name)),
@@ -833,30 +854,30 @@ impl App {
                             ))
                             .size(12),
                             row![
-                                button(if matches!(
-                                    selected,
-                                    Some(ConflictResolution::KeepLocal)
-                                ) {
-                                    "✓ 保留本地"
-                                } else {
-                                    "保留本地"
-                                })
-                                .on_press(Message::SetImportResolution(
-                                    index,
-                                    ConflictResolution::KeepLocal,
-                                )),
-                                button(if matches!(
-                                    selected,
-                                    Some(ConflictResolution::KeepBoth)
-                                ) {
+                                button(
+                                    if matches!(selected, Some(ConflictResolution::KeepLocal)) {
+                                        "✓ 保留本地"
+                                    } else {
+                                        "保留本地"
+                                    },
+                                )
+                                .on_press(
+                                    Message::SetImportResolution(
+                                        index,
+                                        ConflictResolution::KeepLocal,
+                                    )
+                                ),
+                                button(if matches!(selected, Some(ConflictResolution::KeepBoth)) {
                                     "✓ 两份都保留"
                                 } else {
                                     "两份都保留"
                                 })
-                                .on_press(Message::SetImportResolution(
-                                    index,
-                                    ConflictResolution::KeepBoth,
-                                )),
+                                .on_press(
+                                    Message::SetImportResolution(
+                                        index,
+                                        ConflictResolution::KeepBoth,
+                                    )
+                                ),
                             ]
                             .spacing(6)
                         ]
@@ -874,10 +895,12 @@ impl App {
                                     } else {
                                         format!("使用导入值覆盖/恢复：{}", entry.name)
                                     }))
-                                    .on_press(Message::SetImportResolution(
-                                        index,
-                                        ConflictResolution::UseImported(*existing_id),
-                                    )),
+                                    .on_press(
+                                        Message::SetImportResolution(
+                                            index,
+                                            ConflictResolution::UseImported(*existing_id),
+                                        ),
+                                    ),
                                 );
                             }
                         }
@@ -908,7 +931,9 @@ impl App {
             content = if unresolved == 0 {
                 content.push(button("执行导入").on_press(Message::ApplyImport))
             } else {
-                content.push(text(format!("还有 {unresolved} 个冲突/本地删除条目需要先选择处理方式。")))
+                content.push(text(format!(
+                    "还有 {unresolved} 个冲突/本地删除条目需要先选择处理方式。"
+                )))
             };
         }
 
@@ -963,7 +988,11 @@ impl App {
             text(format!(
                 "有效条目 {} · 回收站 {} · 分类 {}",
                 session.active_entries().count(),
-                session.entries().iter().filter(|entry| entry.is_deleted()).count(),
+                session
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.is_deleted())
+                    .count(),
                 session.categories().len()
             )),
             text(format!("应用版本：{}", env!("CARGO_PKG_VERSION"))),
@@ -1233,8 +1262,8 @@ impl App {
         };
 
         let password = (!legacy_password.is_empty()).then_some(legacy_password.as_str());
-        let result = stage_path(Path::new(&path), password)
-            .and_then(|batch| build_preview(session, batch));
+        let result =
+            stage_path(Path::new(&path), password).and_then(|batch| build_preview(session, batch));
         legacy_password.zeroize();
 
         if let Panel::Import(state) = &mut self.panel {
