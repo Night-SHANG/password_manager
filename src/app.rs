@@ -16,9 +16,12 @@ use crate::import::plan::{
     build_preview,
 };
 use crate::import::stage_path;
+use crate::platform::{self, SecurityEvent};
 use crate::services::{PasswordGeneratorOptions, draft, generate_password, safe_web_url};
 use crate::storage::VaultSession;
 use crate::{AppError, Result};
+
+const PASSWORD_CLIPBOARD_TIMEOUT_MS: u32 = 30_000;
 
 pub fn run() -> iced::Result {
     iced::application(App::new, App::update, App::view)
@@ -41,6 +44,9 @@ struct App {
     revealed: Option<RevealedPassword>,
     confirm_permanent_delete: Option<Uuid>,
     dark_mode: bool,
+    screen_capture_protection_requested: bool,
+    screen_capture_protection_active: bool,
+    security_monitor_ready: bool,
     status: String,
 }
 
@@ -90,6 +96,7 @@ impl EditorState {
 impl Drop for EditorState {
     fn drop(&mut self) {
         self.password.zeroize();
+        self.notes.zeroize();
     }
 }
 
@@ -212,6 +219,10 @@ enum Message {
     ConfirmPlaintextChanged(bool),
     ExportPlaintextCsv,
     DarkModeChanged(bool),
+    ScreenCaptureProtectionChanged(bool),
+    ScreenCaptureProtectionApplied(std::result::Result<bool, String>),
+    PlatformSecurity(SecurityEvent),
+    PasswordClipboardWritten(bool),
 }
 
 impl App {
@@ -230,9 +241,13 @@ impl App {
                 revealed: None,
                 confirm_permanent_delete: None,
                 dark_mode: true,
+                screen_capture_protection_requested: true,
+                screen_capture_protection_active: false,
+                security_monitor_ready: false,
                 status: String::new(),
             },
-            Task::none(),
+            platform::set_screen_capture_protection(true)
+                .map(Message::ScreenCaptureProtectionApplied),
         )
     }
 
@@ -245,7 +260,7 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        keyboard::listen().filter_map(|event| {
+        let hotkeys = keyboard::listen().filter_map(|event| {
             let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
                 return None;
             };
@@ -269,18 +284,28 @@ impl App {
                 }
                 _ => None,
             }
-        })
+        });
+
+        let security = platform::security_events().map(Message::PlatformSecurity);
+
+        Subscription::batch([hotkeys, security])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::VaultPathChanged(value) => self.vault_path = value,
-            Message::MasterPasswordChanged(value) => self.master_password = value,
-            Message::ConfirmPasswordChanged(value) => self.confirm_password = value,
+            Message::MasterPasswordChanged(value) => {
+                self.master_password.zeroize();
+                self.master_password = value;
+            }
+            Message::ConfirmPasswordChanged(value) => {
+                self.confirm_password.zeroize();
+                self.confirm_password = value;
+            }
             Message::CreateVault => self.create_vault(),
             Message::OpenVault => self.open_vault(),
             Message::Save => self.save_now(),
-            Message::Lock => self.lock(),
+            Message::Lock => self.lock_with_status("保险库已锁定"),
             Message::FocusSearch => {
                 if self.session.is_some() {
                     self.panel = Panel::Details;
@@ -332,6 +357,7 @@ impl App {
             }
             Message::EditorNotesChanged(value) => {
                 if let Panel::Editor(state) = &mut self.panel {
+                    state.notes.zeroize();
                     state.notes = value;
                 }
             }
@@ -374,8 +400,9 @@ impl App {
                 {
                     match session.reveal_secret(id) {
                         Ok(secret) => {
-                            self.status = "密码已复制到系统剪贴板".to_string();
-                            return clipboard::write::<Message>(secret.password.clone()).discard();
+                            self.status = "正在复制密码…".to_string();
+                            return clipboard::write(secret.password.clone())
+                                .map(|result| Message::PasswordClipboardWritten(result.is_ok()));
                         }
                         Err(error) => self.status = format!("复制失败：{error}"),
                     }
@@ -463,6 +490,76 @@ impl App {
             }
             Message::ExportPlaintextCsv => self.export_plaintext_csv(),
             Message::DarkModeChanged(value) => self.dark_mode = value,
+            Message::ScreenCaptureProtectionChanged(value) => {
+                self.screen_capture_protection_requested = value;
+                return platform::set_screen_capture_protection(value)
+                    .map(Message::ScreenCaptureProtectionApplied);
+            }
+            Message::ScreenCaptureProtectionApplied(result) => match result {
+                Ok(active) => {
+                    self.screen_capture_protection_requested = active;
+                    self.screen_capture_protection_active = active;
+                    self.status = if active {
+                        "Windows 截图保护已启用".to_string()
+                    } else {
+                        "Windows 截图保护已关闭".to_string()
+                    };
+                }
+                Err(error) => {
+                    self.screen_capture_protection_requested =
+                        self.screen_capture_protection_active;
+                    self.status = format!("截图保护设置失败：{error}");
+                }
+            },
+            Message::PlatformSecurity(event) => match event {
+                SecurityEvent::MonitorReady => {
+                    self.security_monitor_ready = true;
+                    if self.screen_capture_protection_requested
+                        && !self.screen_capture_protection_active
+                    {
+                        return platform::set_screen_capture_protection(true)
+                            .map(Message::ScreenCaptureProtectionApplied);
+                    }
+                }
+                SecurityEvent::MonitorFailed => {
+                    self.security_monitor_ready = false;
+                    self.status =
+                        "Windows 会话安全监控启动失败；锁屏/挂起自动锁不可用".to_string();
+                }
+                SecurityEvent::SessionLocked => {
+                    self.lock_with_status("检测到 Windows 锁屏，保险库已自动锁定");
+                }
+                SecurityEvent::SessionLoggedOff => {
+                    self.lock_with_status("检测到 Windows 会话注销，保险库已自动锁定");
+                }
+                SecurityEvent::SystemSuspending => {
+                    self.lock_with_status("检测到系统挂起，保险库已自动锁定");
+                }
+                SecurityEvent::ClipboardCleanupFailed => {
+                    self.status =
+                        "剪贴板自动清理失败；请手动覆盖或清空剪贴板".to_string();
+                }
+            },
+            Message::PasswordClipboardWritten(success) => {
+                if success {
+                    let sequence = platform::clipboard_sequence_number();
+                    match platform::arm_clipboard_clear(
+                        sequence,
+                        PASSWORD_CLIPBOARD_TIMEOUT_MS,
+                    ) {
+                        Ok(()) => {
+                            self.status =
+                                "密码已复制；30 秒后仅在剪贴板未被改动时自动清除".to_string();
+                        }
+                        Err(error) => {
+                            self.status =
+                                format!("密码已复制，但自动清理未启用：{error}");
+                        }
+                    }
+                } else {
+                    self.status = "密码复制失败".to_string();
+                }
+            }
         }
 
         Task::none()
@@ -948,7 +1045,28 @@ impl App {
         column![
             text("设置").size(28),
             text("安全"),
-            text("Windows 会话自动锁、截图保护和条件剪贴板清理由 Batch D 的平台安全生命周期接入。")
+            checkbox(self.screen_capture_protection_requested)
+                .label("阻止常规屏幕捕获（Windows WDA_EXCLUDEFROMCAPTURE）")
+                .on_toggle(Message::ScreenCaptureProtectionChanged),
+            text(format!(
+                "截图保护状态：{}",
+                if self.screen_capture_protection_active {
+                    "已启用"
+                } else {
+                    "未启用"
+                }
+            ))
+            .size(12),
+            text(format!(
+                "Windows 会话监控：{}",
+                if self.security_monitor_ready {
+                    "已就绪"
+                } else {
+                    "未就绪"
+                }
+            ))
+            .size(12),
+            text("锁屏、注销或系统挂起时自动锁定保险库。复制密码后 30 秒，仅当剪贴板序列号未变化时清除。")
                 .size(12),
             text("保险库"),
             text(format!("Vault ID：{}", session.vault_id())),
@@ -1056,11 +1174,12 @@ impl App {
         };
     }
 
-    fn lock(&mut self) {
+    fn lock_with_status(&mut self, status: &str) {
+        let _ = platform::clear_armed_clipboard_now();
         self.session = None;
         self.reset_unlocked_state();
         self.clear_password_fields();
-        self.status = "保险库已锁定".to_string();
+        self.status = status.to_string();
     }
 
     fn open_editor_for_selected(&mut self) {
@@ -1481,6 +1600,7 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        let _ = platform::clear_armed_clipboard_now();
         self.clear_password_fields();
     }
 }
