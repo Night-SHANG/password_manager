@@ -9,7 +9,7 @@ use fernet::Fernet;
 use pbkdf2::pbkdf2_hmac_array;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Deserialize;
-use sha2::Sha256 as LegacySha256;
+use sha2_legacy::Sha256 as LegacySha256;
 use zeroize::Zeroize;
 
 use crate::import::{
