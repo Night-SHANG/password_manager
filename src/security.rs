@@ -108,10 +108,12 @@ pub fn seal(
     aad: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(key_bytes));
+    let key: &Key = key_bytes.into();
+    let nonce: &XNonce = nonce_bytes.into();
+    let cipher = XChaCha20Poly1305::new(key);
     cipher
         .encrypt(
-            XNonce::from_slice(nonce_bytes),
+            nonce,
             Payload {
                 msg: plaintext,
                 aad,
@@ -126,10 +128,12 @@ pub fn open(
     aad: &[u8],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>> {
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(key_bytes));
+    let key: &Key = key_bytes.into();
+    let nonce: &XNonce = nonce_bytes.into();
+    let cipher = XChaCha20Poly1305::new(key);
     cipher
         .decrypt(
-            XNonce::from_slice(nonce_bytes),
+            nonce,
             Payload {
                 msg: ciphertext,
                 aad,

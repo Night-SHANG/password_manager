@@ -31,10 +31,10 @@ pub fn atomic_replace(target: &Path, replacement: &Path, backup: Option<&Path>) 
     if target.exists() {
         let backup_w = backup.map(to_wide);
 
-        if let Some(path) = backup {
-            if path.exists() {
-                std::fs::remove_file(path).map_err(|e| AppError::io(path.to_path_buf(), e))?;
-            }
+        if let Some(path) = backup
+            && path.exists()
+        {
+            std::fs::remove_file(path).map_err(|e| AppError::io(path.to_path_buf(), e))?;
         }
 
         unsafe {

@@ -136,10 +136,10 @@ fn provider_from_headers(headers: &csv::StringRecord) -> &'static str {
 }
 
 fn host_fallback(url: &str) -> String {
-    if let Ok(parsed) = url::Url::parse(url) {
-        if let Some(host) = parsed.host_str() {
-            return host.to_string();
-        }
+    if let Ok(parsed) = url::Url::parse(url)
+        && let Some(host) = parsed.host_str()
+    {
+        return host.to_string();
     }
 
     url.split_once("://")
@@ -151,20 +151,9 @@ fn host_fallback(url: &str) -> String {
         .to_string()
 }
 
-fn fingerprint(
-    provider: &str,
-    stable_id: &str,
-    name: &str,
-    url: &str,
-    username: &str,
-    password: &str,
-    notes: &str,
-    category: &str,
-) -> [u8; 32] {
+fn fingerprint(parts: &[&str]) -> [u8; 32] {
     let mut canonical = Vec::new();
-    for value in [
-        provider, stable_id, name, url, username, password, notes, category,
-    ] {
+    for &value in parts {
         canonical.extend_from_slice(value.as_bytes());
         canonical.push(0x1f);
     }
@@ -221,16 +210,16 @@ pub fn parse_reader<R: Read>(reader: R) -> Result<ImportParseResult> {
         let stable_id_raw = mapping.value(&row, LogicalField::StableId);
         let stable_id = (!stable_id_raw.is_empty()).then(|| stable_id_raw.to_string());
 
-        let item_fingerprint = fingerprint(
-            &provider,
+        let item_fingerprint = fingerprint(&[
+            provider.as_str(),
             stable_id_raw,
-            &name,
+            name.as_str(),
             url,
-            &username,
+            username.as_str(),
             password,
-            &notes,
-            &category,
-        );
+            notes.as_str(),
+            category.as_str(),
+        ]);
 
         result.items.push(NormalizedImportItem {
             provider: provider.clone(),
