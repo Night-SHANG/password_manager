@@ -36,6 +36,7 @@ fn probe_atomic_replace() -> Result<(), Box<dyn std::error::Error>> {
     let mut f = File::create(&replacement)?;
     f.write_all(b"new")?;
     f.sync_all()?;
+    drop(f);
 
     let target_w = to_wide(&target);
     let replacement_w = to_wide(&replacement);
