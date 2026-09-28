@@ -54,8 +54,9 @@ pub fn stage_vault_enc(path: &Path, master_password: &str) -> Result<ImportBatch
     let cipher = legacy_cipher(master_password, &envelope.salt)?;
 
     let token_bytes = STANDARD.decode(envelope.passwords.as_bytes())?;
-    let token = std::str::from_utf8(&token_bytes)
-        .map_err(|error| AppError::migration(format!("旧 vault.enc Fernet token 不是 UTF-8：{error}")))?;
+    let token = std::str::from_utf8(&token_bytes).map_err(|error| {
+        AppError::migration(format!("旧 vault.enc Fernet token 不是 UTF-8：{error}"))
+    })?;
 
     let mut plaintext = cipher
         .decrypt(token)
@@ -142,7 +143,8 @@ pub fn stage_passwords_db(path: &Path, master_password: &str) -> Result<ImportBa
         .map_err(AppError::migration)?;
 
     let salt = salt.ok_or_else(|| AppError::Migration("旧 passwords.db 缺少 salt".to_string()))?;
-    let verify = verify.ok_or_else(|| AppError::Migration("旧 passwords.db 缺少 verify".to_string()))?;
+    let verify =
+        verify.ok_or_else(|| AppError::Migration("旧 passwords.db 缺少 verify".to_string()))?;
     let cipher = legacy_cipher(master_password, &salt)?;
 
     let mut verification = decrypt_legacy_text(&cipher, &verify)
@@ -202,9 +204,7 @@ pub fn stage_passwords_db(path: &Path, master_password: &str) -> Result<ImportBa
             }
         };
 
-        if password.is_empty()
-            || (row.name.trim().is_empty() && row.website.trim().is_empty())
-        {
+        if password.is_empty() || (row.name.trim().is_empty() && row.website.trim().is_empty()) {
             invalid_rows += 1;
             continue;
         }
@@ -254,8 +254,11 @@ fn legacy_cipher(master_password: &str, salt_b64: &str) -> Result<Fernet> {
         ));
     }
 
-    let mut raw_key =
-        pbkdf2_hmac_array::<LegacySha256, 32>(master_password.as_bytes(), &salt, LEGACY_PBKDF2_ITERATIONS);
+    let mut raw_key = pbkdf2_hmac_array::<LegacySha256, 32>(
+        master_password.as_bytes(),
+        &salt,
+        LEGACY_PBKDF2_ITERATIONS,
+    );
     let mut encoded_key = URL_SAFE.encode(raw_key);
     raw_key.zeroize();
 
@@ -288,8 +291,7 @@ fn copy_sqlite_snapshot(path: &Path) -> Result<(tempfile::TempDir, PathBuf)> {
         let source = sidecar_path(path, suffix);
         if source.exists() {
             let destination = sidecar_path(&snapshot, suffix);
-            fs::copy(&source, &destination)
-                .map_err(|error| AppError::io(source.clone(), error))?;
+            fs::copy(&source, &destination).map_err(|error| AppError::io(source.clone(), error))?;
         }
     }
 

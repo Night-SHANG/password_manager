@@ -297,9 +297,7 @@ impl VaultSession {
 
     pub fn export_encrypted_backup(&self, destination: &Path) -> Result<()> {
         if same_path(&self.path, destination) {
-            return Err(AppError::Input(
-                "备份目标不能与当前保险库相同".to_string(),
-            ));
+            return Err(AppError::Input("备份目标不能与当前保险库相同".to_string()));
         }
         if destination.exists() {
             return Err(AppError::AlreadyExists);
@@ -317,7 +315,9 @@ impl VaultSession {
         let copied = read_bounded(destination)?;
         if security::sha256(&copied) != self.source_hash {
             let _ = fs::remove_file(destination);
-            return Err(AppError::InvalidVault("encrypted backup verification failed"));
+            return Err(AppError::InvalidVault(
+                "encrypted backup verification failed",
+            ));
         }
 
         Ok(())
@@ -330,9 +330,7 @@ impl VaultSession {
         overwrite: bool,
     ) -> Result<()> {
         if same_path(source, destination) {
-            return Err(AppError::Input(
-                "恢复源与目标不能是同一个文件".to_string(),
-            ));
+            return Err(AppError::Input("恢复源与目标不能是同一个文件".to_string()));
         }
         if destination.exists() && !overwrite {
             return Err(AppError::AlreadyExists);
@@ -420,8 +418,7 @@ impl VaultSession {
     }
 
     fn ensure_category(&mut self, category: &str) {
-        if !category.trim().is_empty()
-            && !self.body.categories.iter().any(|item| item == category)
+        if !category.trim().is_empty() && !self.body.categories.iter().any(|item| item == category)
         {
             self.body.categories.push(category.to_string());
         }
@@ -518,12 +515,16 @@ fn verify_encoded_bytes(
         || file.header.wrap_nonce != expected_header.wrap_nonce
         || file.header.wrapped_vault_key != expected_header.wrapped_vault_key
     {
-        return Err(AppError::InvalidVault("persisted header verification mismatch"));
+        return Err(AppError::InvalidVault(
+            "persisted header verification mismatch",
+        ));
     }
 
     let decoded = decode_body(&file, keys)?;
     if decoded != *expected_body {
-        return Err(AppError::InvalidVault("persisted body verification mismatch"));
+        return Err(AppError::InvalidVault(
+            "persisted body verification mismatch",
+        ));
     }
     Ok(())
 }

@@ -1,7 +1,5 @@
 use password_manager::domain::EntryDraft;
-use password_manager::export::{
-    PlaintextExportAcknowledgement, export_plaintext_csv,
-};
+use password_manager::export::{PlaintextExportAcknowledgement, export_plaintext_csv};
 use password_manager::import::csv;
 use password_manager::storage::VaultSession;
 

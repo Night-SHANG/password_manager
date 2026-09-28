@@ -25,8 +25,7 @@ pub fn export_plaintext_csv(
     if let Some(parent) = destination.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent)
-            .map_err(|error| AppError::io(parent.to_path_buf(), error))?;
+        fs::create_dir_all(parent).map_err(|error| AppError::io(parent.to_path_buf(), error))?;
     }
 
     let file = OpenOptions::new()

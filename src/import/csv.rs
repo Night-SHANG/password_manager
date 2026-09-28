@@ -179,15 +179,8 @@ pub fn parse_reader<R: Read>(reader: R) -> Result<ImportParseResult> {
         let stable_id = (!stable_id_raw.is_empty()).then(|| stable_id_raw.to_string());
         let favorite = false;
 
-        let item_fingerprint = content_fingerprint(
-            &name,
-            url,
-            &username,
-            password,
-            &notes,
-            &category,
-            favorite,
-        );
+        let item_fingerprint =
+            content_fingerprint(&name, url, &username, password, &notes, &category, favorite);
 
         result.items.push(NormalizedImportItem {
             provider: provider.clone(),

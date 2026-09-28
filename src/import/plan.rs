@@ -2,9 +2,7 @@ use std::collections::BTreeMap;
 
 use uuid::Uuid;
 
-use crate::domain::{
-    EntryDraft, ImportProvenance, ImportSourceRecord, SecretPayload,
-};
+use crate::domain::{EntryDraft, ImportProvenance, ImportSourceRecord, SecretPayload};
 use crate::import::{
     ImportBatch, NormalizedImportItem, content_fingerprint, now_unix, weak_identity_key,
 };
@@ -262,9 +260,7 @@ fn apply_preview_inner(
         });
     }
 
-    let changed = report.added > 0
-        || report.updated > 0
-        || (fully_resolved && !already_recorded);
+    let changed = report.added > 0 || report.updated > 0 || (fully_resolved && !already_recorded);
 
     if changed {
         vault.save()?;

@@ -13,8 +13,7 @@ use rusqlite::{Connection, params};
 use zeroize::Zeroize;
 
 fn legacy_cipher(master_password: &str, salt: &[u8; 16]) -> Fernet {
-    let mut raw =
-        pbkdf2_hmac_array::<LegacySha256, 32>(master_password.as_bytes(), salt, 480_000);
+    let mut raw = pbkdf2_hmac_array::<LegacySha256, 32>(master_password.as_bytes(), salt, 480_000);
     let key = URL_SAFE.encode(raw);
     raw.zeroize();
     Fernet::new(&key).unwrap()
@@ -24,11 +23,7 @@ fn legacy_encrypt(cipher: &Fernet, plaintext: &str) -> String {
     STANDARD.encode(cipher.encrypt(plaintext.as_bytes()).as_bytes())
 }
 
-fn create_legacy_db(
-    path: &std::path::Path,
-    master_password: &str,
-    stored_password: &str,
-) {
+fn create_legacy_db(path: &std::path::Path, master_password: &str, stored_password: &str) {
     let salt = [9u8; 16];
     let cipher = legacy_cipher(master_password, &salt);
 
@@ -130,11 +125,7 @@ fn legacy_db_stable_id_supports_true_incremental_update() {
     create_legacy_db(&old_db, "old-master", "source-v1");
 
     let mut vault = VaultSession::create(&vault_path, "new-master").unwrap();
-    let first = build_preview(
-        &vault,
-        stage_passwords_db(&old_db, "old-master").unwrap(),
-    )
-    .unwrap();
+    let first = build_preview(&vault, stage_passwords_db(&old_db, "old-master").unwrap()).unwrap();
     apply_preview(
         &mut vault,
         &first,
@@ -150,19 +141,12 @@ fn legacy_db_stable_id_supports_true_incremental_update() {
     let cipher = legacy_cipher("old-master", &salt);
     conn.execute(
         "UPDATE entries SET password = ?1, updated_at = ?2 WHERE id = 1",
-        params![
-            legacy_encrypt(&cipher, "source-v2"),
-            "2026-02-01T00:00:00"
-        ],
+        params![legacy_encrypt(&cipher, "source-v2"), "2026-02-01T00:00:00"],
     )
     .unwrap();
     drop(conn);
 
-    let second = build_preview(
-        &vault,
-        stage_passwords_db(&old_db, "old-master").unwrap(),
-    )
-    .unwrap();
+    let second = build_preview(&vault, stage_passwords_db(&old_db, "old-master").unwrap()).unwrap();
     assert!(matches!(
         &second.rows[0].class,
         ImportClass::UpdateCandidate { .. }

@@ -23,13 +23,7 @@ fn encrypted_backup_restore_preserves_vault_identity() {
     let revision = vault.revision();
     vault.export_encrypted_backup(&backup).unwrap();
 
-    VaultSession::restore_encrypted_backup(
-        &backup,
-        &restored,
-        "master-password",
-        false,
-    )
-    .unwrap();
+    VaultSession::restore_encrypted_backup(&backup, &restored, "master-password", false).unwrap();
 
     let restored = VaultSession::open(&restored, "master-password").unwrap();
     assert_eq!(restored.vault_id(), vault_id);
@@ -49,12 +43,7 @@ fn restore_can_atomically_replace_an_existing_vault() {
 
     let mut source_vault = VaultSession::create(&source, "source-master").unwrap();
     source_vault
-        .add_entry(EntryDraft::login(
-            "Source",
-            "https://source.test",
-            "u",
-            "p",
-        ))
+        .add_entry(EntryDraft::login("Source", "https://source.test", "u", "p"))
         .unwrap();
     source_vault.save().unwrap();
     source_vault.export_encrypted_backup(&backup).unwrap();
@@ -62,13 +51,7 @@ fn restore_can_atomically_replace_an_existing_vault() {
 
     VaultSession::create(&target, "different-master").unwrap();
 
-    VaultSession::restore_encrypted_backup(
-        &backup,
-        &target,
-        "source-master",
-        true,
-    )
-    .unwrap();
+    VaultSession::restore_encrypted_backup(&backup, &target, "source-master", true).unwrap();
 
     let restored = VaultSession::open(&target, "source-master").unwrap();
     assert_eq!(restored.vault_id(), expected_id);
