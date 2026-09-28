@@ -401,8 +401,11 @@ impl App {
                     match session.reveal_secret(id) {
                         Ok(secret) => {
                             self.status = "正在复制密码…".to_string();
-                            return clipboard::write(secret.password.clone())
-                                .map(|result| Message::PasswordClipboardWritten(result.is_ok()));
+                            return clipboard::write(secret.password.clone()).map(
+                                |result: std::result::Result<(), iced::clipboard::Error>| {
+                                    Message::PasswordClipboardWritten(result.is_ok())
+                                },
+                            );
                         }
                         Err(error) => self.status = format!("复制失败：{error}"),
                     }
