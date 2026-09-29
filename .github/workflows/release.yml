@@ -3,8 +3,12 @@ name: Windows Release
 on:
   workflow_dispatch:
   push:
+    branches:
+      - dev/rust-rewrite-v1
     tags:
       - "v*"
+    paths:
+      - ".github/workflows/release.yml"
 
 permissions:
   contents: read
