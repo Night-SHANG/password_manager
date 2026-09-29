@@ -42,12 +42,7 @@ pub fn run_release_smoke() -> Result<()> {
     }
 
     reopened.export_encrypted_backup(&backup_path)?;
-    VaultSession::restore_encrypted_backup(
-        &backup_path,
-        &restored_path,
-        &master_password,
-        false,
-    )?;
+    VaultSession::restore_encrypted_backup(&backup_path, &restored_path, &master_password, false)?;
 
     let restored = VaultSession::open(&restored_path, &master_password)?;
     if restored.vault_id() != reopened.vault_id() || restored.revision() != reopened.revision() {
