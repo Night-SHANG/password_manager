@@ -542,8 +542,7 @@ impl App {
                 let sequence = platform::clipboard_sequence_number();
                 match platform::arm_clipboard_clear(sequence, PASSWORD_CLIPBOARD_TIMEOUT_MS) {
                     Ok(()) => {
-                        self.status =
-                            "密码已复制；30 秒后仅在剪贴板未被改动时自动清除".to_string();
+                        self.status = "密码已复制；30 秒后仅在剪贴板未被改动时自动清除".to_string();
                     }
                     Err(error) => {
                         self.status = format!("密码已复制，但自动清理未启用：{error}");
