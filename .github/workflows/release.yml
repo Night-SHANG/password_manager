@@ -1,0 +1,119 @@
+name: Windows Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify source
+        run: |
+          cargo fmt --all -- --check
+          cargo check --all-targets --locked
+          cargo test --all-targets --locked
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Resolve version and verify tag
+        id: version
+        shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object { $_.name -eq "password-manager" } | Select-Object -First 1).version
+          if (-not $version) {
+            throw "Could not resolve package version."
+          }
+
+          if ($env:REF_TYPE -eq "tag" -and $env:REF_NAME -ne "v$version") {
+            throw "Tag $env:REF_NAME does not match Cargo version v$version."
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Release binary self-test
+        shell: pwsh
+        run: |
+          & "target/release/password-manager.exe" --self-test
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release binary self-test failed."
+          }
+
+      - name: Package Windows release
+        shell: pwsh
+        run: |
+          & "./scripts/package-windows.ps1"             -ExePath "target/release/password-manager.exe"             -OutDir "dist"             -Version "${{ steps.version.outputs.version }}"             -CommitSha "$env:GITHUB_SHA"
+
+      - name: Unpack release and smoke again
+        shell: pwsh
+        run: |
+          $unpack = Join-Path $env:RUNNER_TEMP "password-manager-release-smoke"
+          if (Test-Path $unpack) {
+            Remove-Item -Recurse -Force $unpack
+          }
+          Expand-Archive -Path "dist/password-manager-windows-x64.zip" -DestinationPath $unpack
+          & (Join-Path $unpack "password-manager.exe") --self-test
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unpacked release self-test failed."
+          }
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: password-manager-windows-x64-${{ github.run_number }}
+          path: |
+            dist/password-manager.exe
+            dist/password-manager-windows-x64.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attest executable provenance
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/password-manager.exe
+
+      - name: Attest archive provenance
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/password-manager-windows-x64.zip
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$env:GITHUB_REF_NAME"             "dist/password-manager.exe"             "dist/password-manager-windows-x64.zip"             "dist/SHA256SUMS.txt"             --repo "$env:GITHUB_REPOSITORY"             --verify-tag             --generate-notes             --title "Password Manager $env:GITHUB_REF_NAME"

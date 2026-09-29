@@ -7,26 +7,66 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - "deny.toml"
       - "src/**"
       - "tests/**"
-      - ".github/workflows/preflight.yml"
+      - "scripts/**"
+      - "docs/**"
+      - ".github/workflows/**"
       - ".gitignore"
+      - "README.md"
   pull_request:
     branches:
       - main
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  preflight:
-    runs-on: windows-latest
-    timeout-minutes: 35
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+
+  dependency-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          rust-version: "1.88.0"
+          command: check advisories licenses
+          arguments: --all-features
+
+  preflight:
+    needs:
+      - secret-scan
+      - dependency-policy
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -69,6 +109,67 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Reject sensitive logging patterns
+        shell: pwsh
+        run: |
+          $patterns = @(
+            '(?i)println!\s*\([^\r\n]*(master_password|password|secret)',
+            '(?i)eprintln!\s*\([^\r\n]*(master_password|password|secret)',
+            '(?i)tracing::(trace|debug|info|warn|error)!\s*\([^\r\n]*(master_password|password|secret)'
+          )
+          $hits = Get-ChildItem src -Recurse -Filter *.rs | Select-String -Pattern $patterns
+          if ($hits) {
+            Write-Host "Potential sensitive logging patterns:"
+            $hits | ForEach-Object { Write-Host $_.ToString() }
+            exit 1
+          }
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Release binary self-test
+        shell: pwsh
+        run: |
+          & "target/release/password-manager.exe" --self-test
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release binary self-test failed."
+          }
+
+      - name: Package Windows release
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object { $_.name -eq "password-manager" } | Select-Object -First 1).version
+          if (-not $version) {
+            throw "Could not resolve package version."
+          }
+
+          & "./scripts/package-windows.ps1"             -ExePath "target/release/password-manager.exe"             -OutDir "dist"             -Version $version             -CommitSha "$env:GITHUB_SHA"
+
+      - name: Unpack release and smoke again
+        shell: pwsh
+        run: |
+          $unpack = Join-Path $env:RUNNER_TEMP "password-manager-release-smoke"
+          if (Test-Path $unpack) {
+            Remove-Item -Recurse -Force $unpack
+          }
+          Expand-Archive -Path "dist/password-manager-windows-x64.zip" -DestinationPath $unpack
+          & (Join-Path $unpack "password-manager.exe") --self-test
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unpacked release self-test failed."
+          }
+
+      - name: Upload validated Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: password-manager-preflight-${{ github.run_number }}
+          path: |
+            dist/password-manager.exe
+            dist/password-manager-windows-x64.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Commit Cargo.lock after a green bootstrap
         if: github.event_name == 'push' && github.ref == 'refs/heads/dev/rust-rewrite-v1'
