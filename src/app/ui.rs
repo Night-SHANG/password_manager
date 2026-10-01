@@ -1,14 +1,15 @@
 use iced::widget::{
-    Space, button, checkbox, column, container, mouse_area, opaque, row, scrollable, stack, table,
+    Space, button, checkbox, column, container, mouse_area, opaque, row, scrollable, stack,
     text, text_input,
 };
 use iced::{Alignment, Color};
 
 use super::*;
 
+mod forms;
+
 const SIDEBAR_WIDTH: f32 = 250.0;
-const COLUMN_WIDTHS: [f32; 5] = [180.0, 220.0, 160.0, 120.0, 80.0];
-const HEADERS: [&str; 5] = ["名称", "网站", "用户名", "密码", "分类"];
+const CARD_WIDTH: f32 = 272.0;
 
 fn field<'a>(
     label: &'a str,
@@ -40,12 +41,71 @@ fn secret_field<'a>(
     .into()
 }
 
+fn surface(theme: &Theme) -> container::Style {
+    let dark = matches!(theme, Theme::Dark);
+    container::Style {
+        background: Some(
+            if dark {
+                theme.extended_palette().background.weak.color
+            } else {
+                Color::WHITE
+            }
+            .into(),
+        ),
+        text_color: Some(theme.palette().text),
+        border: iced::Border {
+            color: if dark {
+                theme.extended_palette().background.strong.color
+            } else {
+                Color::from_rgb8(225, 229, 235)
+            },
+            width: 1.0,
+            radius: 12.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 fn card<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     container(content)
         .padding(22)
         .width(Length::Fill)
-        .style(container::rounded_box)
+        .style(surface)
         .into()
+}
+
+fn divider<'a>() -> Element<'a, Message> {
+    container(Space::new().height(1))
+        .width(Length::Fill)
+        .style(|theme: &Theme| container::Style {
+            background: Some(theme.extended_palette().background.strong.color.into()),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+fn card_button<'a>(label: &'a str, id: String, message: Message) -> Element<'a, Message> {
+    container(
+        button(text(label).size(12))
+            .on_press(message)
+            .style(button::secondary)
+            .padding([8, 6])
+            .width(72),
+    )
+    .id(id)
+    .into()
+}
+
+fn card_line<'a>(label: &'a str, value: &'a str) -> Element<'a, Message> {
+    row![
+        text(label).size(13).width(42),
+        container(text(value).size(13).wrapping(text::Wrapping::None))
+            .width(Length::Fill)
+            .clip(true),
+    ]
+    .align_y(Alignment::Center)
+    .height(24)
+    .into()
 }
 
 impl App {
@@ -54,7 +114,7 @@ impl App {
             return self.locked_view();
         };
         let content = match &self.panel {
-            Panel::Vault => self.table_view(session),
+            Panel::Vault => self.cards_view(session),
             Panel::Editor(state) => self.editor_view(state),
             Panel::Import(state) => self.import_view(session, state),
             Panel::Settings(state) => self.settings_view(session, state),
@@ -69,19 +129,21 @@ impl App {
                 Message::ConfirmDeleteCategory(name.clone()),
             ),
         };
-        let base: Element<'_, Message> = column![
-            row![
-                self.sidebar_view(session),
+        let base: Element<'_, Message> = row![
+            self.sidebar_view(session),
+            column![
                 container(content)
-                    .padding(20)
+                    .padding(24)
                     .width(Length::Fill)
-                    .height(Length::Fill)
+                    .height(Length::Fill),
+                container(text(&self.status).size(12))
+                    .padding([8, 24])
+                    .width(Length::Fill),
             ]
+            .width(Length::Fill)
             .height(Length::Fill),
-            container(text(&self.status).size(13))
-                .padding([8, 16])
-                .width(Length::Fill),
         ]
+        .width(Length::Fill)
         .height(Length::Fill)
         .into();
         if self.context_open && matches!(&self.panel, Panel::Vault) {
@@ -89,12 +151,10 @@ impl App {
                 base,
                 opaque(
                     container(
-                        mouse_area(
-                            container(self.context_view())
-                                .padding(20)
-                                .style(container::rounded_box)
-                        )
-                        .on_press(Message::CloseContext)
+                        container(self.context_view())
+                            .padding(24)
+                            .width(560)
+                            .style(surface)
                     )
                     .center_x(Length::Fill)
                     .center_y(Length::Fill)
@@ -117,42 +177,30 @@ impl App {
             Message::OpenVault
         };
         let mut form = column![
-            text("密码管理器").size(30),
-            text("本地加密保险库").size(14),
-            row![
-                button("打开保险库")
-                    .on_press(Message::AuthMode(false))
-                    .style(if self.creating {
-                        button::secondary
-                    } else {
-                        button::primary
-                    }),
-                button("创建新保险库")
-                    .on_press(Message::AuthMode(true))
-                    .style(if self.creating {
-                        button::primary
-                    } else {
-                        button::secondary
-                    }),
-            ]
-            .spacing(10),
-            field(
-                "保险库文件路径",
-                "例如 D:\\Passwords\\main.pmvault",
-                &self.vault_path,
-                Message::VaultPathChanged
-            ),
-            column![
-                text("主密码").size(13),
-                text_input("输入主密码", &self.master_password)
-                    .on_input(Message::MasterPasswordChanged)
-                    .on_submit(submit.clone())
-                    .secure(true)
-                    .padding(10)
-            ]
-            .spacing(5),
+            text("🔐")
+                .size(if self.creating { 32 } else { 56 })
+                .width(Length::Fill)
+                .align_x(Alignment::Center),
+            text(if self.creating { "创建密码库" } else { "解锁密码库" })
+                .size(25)
+                .width(Length::Fill)
+                .align_x(Alignment::Center),
+            text(if self.creating {
+                "设置主密码以保护本地数据"
+            } else {
+                "请输入主密码以解密数据"
+            })
+            .size(13)
+            .width(Length::Fill)
+            .align_x(Alignment::Center),
+            text_input("输入主密码", &self.master_password)
+                .on_input(Message::MasterPasswordChanged)
+                .on_submit(submit.clone())
+                .secure(true)
+                .padding(14)
+                .size(16),
         ]
-        .spacing(16);
+        .spacing(if self.creating { 10 } else { 16 });
         if self.creating {
             form = form.push(secret_field(
                 "确认主密码",
@@ -160,28 +208,64 @@ impl App {
                 Message::ConfirmPasswordChanged,
             ));
         }
+        if self.creating || self.auth_options_open {
+            form = form.push(field(
+                "保险库文件路径",
+                "例如 D:\\Passwords\\main.pmvault",
+                &self.vault_path,
+                Message::VaultPathChanged,
+            ));
+        }
         form = form
             .push(
-                button(if self.creating {
-                    "创建并进入"
-                } else {
-                    "解锁保险库"
-                })
-                .on_press(submit)
-                .padding(12)
-                .width(Length::Fill),
+                button(text(if self.creating { "创建并进入" } else { "解 锁" }))
+                    .on_press(submit)
+                    .padding(14)
+                    .width(Length::Fill),
             )
-            .push(text("主密码不会保存，也没有找回后门。请先用测试保险库验证此版本。").size(12))
-            .push(text(&self.status).size(13));
-        container(scrollable(
-            container(card(form))
-                .max_width(600)
-                .padding(24)
-                .center_x(Length::Fill),
-        ))
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
-        .into()
+            .push(
+                row![
+                    button("打开保险库")
+                        .on_press(Message::AuthMode(false))
+                        .style(button::text),
+                    button("创建新保险库")
+                        .on_press(Message::AuthMode(true))
+                        .style(button::text),
+                ]
+                .spacing(8),
+            );
+        if !self.creating {
+            form = form.push(
+                button(if self.auth_options_open { "收起文件位置" } else { "更换保险库文件" })
+                    .on_press(Message::ToggleAuthOptions)
+                    .style(button::text),
+            );
+        }
+        form = form.push(text("本地加密 · 测试版本，请勿作为唯一密码副本").size(11));
+        if !self.status.is_empty() {
+            form = form.push(text(&self.status).size(12));
+        }
+        // Bound the card first, then center it in the full viewport. Only its
+        // contents scroll on smaller windows; no unbounded horizontal layout.
+        let auth = container(scrollable(form).height(Length::Shrink))
+            .id("auth-card")
+            .width(400)
+            .max_height(580)
+            .padding(if self.creating { 24 } else { 32 })
+            .style(|theme: &Theme| {
+                let mut style = surface(theme);
+                style.shadow = iced::Shadow {
+                    color: Color::from_rgba(0.0, 0.0, 0.0, 0.16),
+                    offset: iced::Vector::new(0.0, 16.0),
+                    blur_radius: 30.0,
+                };
+                style
+            });
+        container(auth)
+            .padding(24)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into()
     }
 
     fn nav_button<'a>(
@@ -194,21 +278,26 @@ impl App {
         let enabled = matches!(&self.panel, Panel::Vault);
         button(
             row![
-                text(title),
-                Space::new().width(Length::Fill),
-                text(count.to_string()).size(12)
+                text("📁").size(13),
+                container(text(title).size(13).wrapping(text::Wrapping::None))
+                    .width(Length::Fill)
+                    .clip(true),
+                text(count.to_string()).size(12),
             ]
+            .spacing(10)
             .align_y(Alignment::Center),
         )
         .on_press_maybe(enabled.then_some(Message::SetNav(nav)))
         .padding([10, 12])
         .width(Length::Fill)
-        .style(move |theme, status| {
+        .style(move |theme: &Theme, status| {
+            let mut style = button::text(theme, status);
             if selected {
-                button::primary(theme, status)
-            } else {
-                button::text(theme, status)
+                let palette = theme.extended_palette();
+                style.background = Some(palette.primary.weak.color.into());
+                style.text_color = palette.primary.strong.color;
             }
+            style
         })
         .into()
     }
@@ -216,11 +305,7 @@ impl App {
     fn sidebar_view<'a>(&'a self, session: &'a VaultSession) -> Element<'a, Message> {
         let enabled = matches!(&self.panel, Panel::Vault);
         let mut categories = column![
-            self.nav_button(
-                "全部".to_string(),
-                NavFilter::All,
-                session.active_entries().count()
-            ),
+            self.nav_button("全部".to_string(), NavFilter::All, session.active_entries().count()),
             self.nav_button(
                 "收藏".to_string(),
                 NavFilter::Favorites,
@@ -231,215 +316,223 @@ impl App {
                 NavFilter::RecycleBin,
                 session.entries().iter().filter(|e| e.is_deleted()).count()
             ),
-            text("分类").size(12),
+            divider(),
         ]
         .spacing(5);
         for name in session.categories() {
-            categories = categories.push(
-                self.nav_button(
-                    name.clone(),
-                    NavFilter::Category(name.clone()),
-                    session
-                        .active_entries()
-                        .filter(|e| &e.category == name)
-                        .count(),
-                ),
-            );
+            categories = categories.push(self.nav_button(
+                name.clone(),
+                NavFilter::Category(name.clone()),
+                session.active_entries().filter(|e| &e.category == name).count(),
+            ));
             if enabled && self.nav == NavFilter::Category(name.clone()) && name != "其他" {
                 categories = categories.push(
                     row![
-                        button("上移")
-                            .on_press(Message::MoveCategory(name.clone(), true))
-                            .style(button::text),
-                        button("下移")
-                            .on_press(Message::MoveCategory(name.clone(), false))
-                            .style(button::text),
-                        button("删除分类")
+                        button("上移").on_press(Message::MoveCategory(name.clone(), true)),
+                        button("下移").on_press(Message::MoveCategory(name.clone(), false)),
+                        button("删除")
                             .on_press(Message::RequestDeleteCategory(name.clone()))
                             .style(button::danger),
                     ]
-                    .spacing(2),
+                    .spacing(4),
                 );
             }
         }
-        if enabled {
-            categories = categories
-                .push(
+        let mut footer = column![
+            divider(),
+            button("+ 添加新分类")
+                .on_press_maybe(enabled.then_some(Message::ToggleCategoryEditor))
+                .style(button::text)
+                .width(Length::Fill),
+        ]
+        .spacing(8);
+        if self.category_editor_open && enabled {
+            footer = footer.push(
+                row![
                     text_input("新分类名称", &self.category_name)
                         .on_input(Message::CategoryNameChanged)
                         .on_submit(Message::AddCategory)
                         .padding(8),
-                )
-                .push(
-                    button("添加分类")
-                        .on_press(Message::AddCategory)
-                        .style(button::secondary)
-                        .width(Length::Fill),
-                );
+                    button("添加").on_press(Message::AddCategory).padding(8),
+                ]
+                .spacing(6),
+            );
         }
         let sidebar = column![
-            text("密码管理器").size(20),
-            text("本地加密 · 测试版本").size(12),
+            row![text("🔐").size(26), text("密码管理器").size(20)]
+                .spacing(12)
+                .align_y(Alignment::Center),
+            divider(),
             scrollable(categories).height(Length::Fill),
-            button("导入")
+            footer,
+            divider(),
+            button("导入数据")
                 .on_press_maybe(enabled.then_some(Message::OpenImport))
                 .style(button::text)
                 .width(Length::Fill),
-            button("导出 / 备份")
+            button("导出数据 / 备份")
                 .on_press_maybe(enabled.then_some(Message::OpenSettings))
                 .style(button::text)
                 .width(Length::Fill),
-            button("设置")
-                .on_press_maybe(enabled.then_some(Message::OpenSettings))
-                .style(button::text)
-                .width(Length::Fill),
-            button("锁定")
-                .on_press(Message::Lock)
-                .style(button::secondary)
-                .width(Length::Fill),
-            text("Ctrl+F 搜索  ·  Ctrl+L 锁定").size(11),
+            row![
+                button("设置")
+                    .on_press_maybe(enabled.then_some(Message::OpenSettings))
+                    .style(button::text),
+                button("锁定").on_press(Message::Lock).style(button::text),
+            ]
+            .spacing(16),
         ]
-        .spacing(8);
-        let dark = self.dark_mode;
+        .spacing(12);
         container(sidebar)
             .padding(16)
             .width(SIDEBAR_WIDTH)
             .height(Length::Fill)
-            .style(move |theme| {
-                let mut style = container::rounded_box(theme);
-                if !dark {
-                    style.background = Some(Color::from_rgb8(249, 250, 251).into());
-                }
+            .style(|theme: &Theme| {
+                let mut style = surface(theme);
+                style.border.radius = 0.0.into();
                 style
             })
             .into()
     }
 
-    fn table_cell<'a>(&'a self, entry: &'a EntryRecord, column: usize) -> Element<'a, Message> {
-        let label = match column {
-            0 => format!("{}{}", if entry.favorite { "★ " } else { "" }, entry.name),
-            1 => entry.website.clone(),
-            2 => entry.username.clone(),
-            3 => "••••••".to_string(),
-            _ => entry.category.clone(),
-        };
-        let selected = self.selected == Some(entry.id);
-        let dark = self.dark_mode;
-        let cell = container(text(label).size(13).wrapping(text::Wrapping::None))
-            .padding([7, 8])
-            .height(36)
-            .width(Length::Fill)
-            .clip(true)
-            .style(move |theme: &Theme| {
-                let palette = theme.extended_palette();
-                container::Style {
-                    background: Some(
-                        if selected {
-                            palette.primary.weak.color
-                        } else if dark {
-                            palette.background.base.color
-                        } else {
-                            Color::WHITE
-                        }
-                        .into(),
-                    ),
-                    text_color: Some(if selected {
-                        palette.primary.weak.text
-                    } else {
-                        palette.background.base.text
-                    }),
-                    ..container::Style::default()
-                }
-            });
-        mouse_area(cell)
-            .on_press(Message::SelectEntry(entry.id))
-            .on_double_click(Message::EditEntry(entry.id))
-            .on_right_press(Message::ContextEntry(entry.id))
-            .into()
-    }
-
-    fn table_view<'a>(&'a self, session: &'a VaultSession) -> Element<'a, Message> {
+    fn cards_view<'a>(&'a self, session: &'a VaultSession) -> Element<'a, Message> {
         let query = self.search.to_lowercase();
-        let entries: Vec<&EntryRecord> = session
+        let entries: Vec<_> = session
             .entries()
             .iter()
             .filter(|entry| self.entry_visible(entry, &query))
             .collect();
         let count = entries.len();
-        let columns = (0..5).map(|index| {
-            table::column(
-                container(text(HEADERS[index]).size(13))
-                    .height(40)
-                    .padding([10, 8]),
-                move |entry: &'a EntryRecord| self.table_cell(entry, index),
-            )
-            .width(COLUMN_WIDTHS[index])
-        });
-        let grid = table::table(columns, entries).padding(0).separator(1);
-        let direction = scrollable::Direction::Both {
-            vertical: scrollable::Scrollbar::default(),
-            horizontal: scrollable::Scrollbar::default(),
+        let body: Element<'_, Message> = if entries.is_empty() {
+            container(text("没有符合条件的密码。可添加密码或导入数据。").size(14))
+                .padding(24)
+                .width(Length::Fill)
+                .into()
+        } else {
+            // Fixed-width cards + wrapping rows + vertical-only scrolling.
+            // Unlike the replaced table, there is no Fill column in an
+            // unbounded horizontal scroll viewport.
+            row(entries.into_iter().map(|entry| self.password_card(entry)))
+                .spacing(20)
+                .width(Length::Fill)
+                .wrap()
+                .into()
         };
-        let mut body = column![
+        column![
             row![
-                text_input("搜索名称 / 网站 / 用户名", &self.search)
+                text_input("搜索密码...", &self.search)
                     .id(self.search_id.clone())
                     .on_input(Message::SearchChanged)
-                    .padding(10)
+                    .padding(12)
                     .width(Length::Fill),
                 button("清空")
                     .on_press(Message::SearchChanged(String::new()))
                     .style(button::secondary)
-                    .padding(10),
-                button("添加").on_press(Message::NewEntry).padding(10),
+                    .padding(12),
+                button("+ 添加密码").on_press(Message::NewEntry).padding(12),
             ]
-            .spacing(10)
+            .spacing(12)
             .align_y(Alignment::Center),
-            text(format!("显示 {count} 条 · 双击编辑 · 右键快捷操作")).size(12),
-            scrollable(grid).direction(direction).height(Length::Fill),
+            divider(),
+            text(format!("显示 {count} 条 · 右键查看条目操作")).size(12),
+            scrollable(body).height(Length::Fill).width(Length::Fill),
+        ]
+        .spacing(16)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
+    fn password_card<'a>(&'a self, entry: &'a EntryRecord) -> Element<'a, Message> {
+        let id = entry.id;
+        let selected = self.selected == Some(id);
+        let content = column![
+            row![
+                container(text(&entry.name).size(17).wrapping(text::Wrapping::None))
+                    .width(Length::Fill)
+                    .clip(true),
+                button(text(if entry.favorite { "★" } else { "☆" }).size(20))
+                    .on_press_maybe(
+                        (!entry.is_deleted()).then_some(Message::CardAction(id, CardAction::Favorite))
+                    )
+                    .style(button::text)
+                    .padding(2),
+            ]
+            .align_y(Alignment::Center),
+            card_line("账号：", &entry.username),
+            card_line("密码：", "••••••••"),
+            row![
+                text("网址：").size(13).width(42),
+                container(
+                    button(text(&entry.website).size(13).wrapping(text::Wrapping::None))
+                        .on_press(Message::CardAction(id, CardAction::OpenWebsite))
+                        .style(button::text)
+                        .padding(0)
+                )
+                .width(Length::Fill)
+                .clip(true),
+            ]
+            .height(24)
+            .align_y(Alignment::Center),
+            divider(),
+            row![
+                card_button(
+                    "复制账号",
+                    format!("copy-user-{id}"),
+                    Message::CardAction(id, CardAction::CopyUsername)
+                ),
+                card_button(
+                    "复制密码",
+                    format!("copy-password-{id}"),
+                    Message::CardAction(id, CardAction::CopyPassword)
+                ),
+                card_button(
+                    if entry.is_deleted() { "操作" } else { "编辑" },
+                    format!("edit-{id}"),
+                    if entry.is_deleted() { Message::ContextEntry(id) } else { Message::EditEntry(id) }
+                ),
+            ]
+            .spacing(8),
         ]
         .spacing(12);
-        if count == 0 {
-            body = body.push(text("没有符合条件的条目。可点击“添加”或“导入”。").size(14));
-        }
-        if let Some(entry) = self.selected_entry()
-            && self.entry_visible(entry, &query)
-        {
-            body = body.push(self.selection_actions(entry));
-        }
-        body.into()
+        let panel = container(content)
+            .id(format!("card-{id}"))
+            .padding(20)
+            .width(CARD_WIDTH)
+            .height(250)
+            .clip(true)
+            .style(move |theme: &Theme| {
+                let mut style = surface(theme);
+                if selected {
+                    style.border.color = theme.palette().primary;
+                }
+                style
+            });
+        mouse_area(panel)
+            .on_press(Message::SelectEntry(id))
+            .on_double_click(Message::EditEntry(id))
+            .on_right_press(Message::ContextEntry(id))
+            .into()
     }
 
     fn selection_actions<'a>(&'a self, entry: &'a EntryRecord) -> Element<'a, Message> {
         let mut actions = column![
             row![
-                button("复制账号")
-                    .on_press(Message::CopyUsername)
+                button("复制账号").on_press(Message::CopyUsername).style(button::secondary),
+                button("复制密码").on_press(Message::CopyPassword).style(button::secondary),
+                button(if self.revealed.is_some() { "隐藏密码" } else { "显示密码" })
+                    .on_press(Message::ToggleReveal)
                     .style(button::secondary),
-                button("复制密码")
-                    .on_press(Message::CopyPassword)
-                    .style(button::secondary),
-                button(if self.revealed.is_some() {
-                    "隐藏密码"
-                } else {
-                    "显示密码"
-                })
-                .on_press(Message::ToggleReveal)
-                .style(button::secondary),
-                button("打开网页")
-                    .on_press(Message::OpenWebsite)
-                    .style(button::secondary),
+                button("打开网页").on_press(Message::OpenWebsite).style(button::secondary),
             ]
             .spacing(8),
         ]
-        .spacing(8);
+        .spacing(12);
         if entry.is_deleted() {
             actions = actions.push(
                 row![
                     button("恢复条目").on_press(Message::RestoreSelected),
-                    button("永久删除")
-                        .on_press(Message::RequestPermanentDelete)
-                        .style(button::danger)
+                    button("永久删除").on_press(Message::RequestPermanentDelete).style(button::danger),
                 ]
                 .spacing(8),
             );
@@ -447,16 +540,10 @@ impl App {
             actions = actions.push(
                 row![
                     button("编辑条目").on_press(Message::EditSelected),
-                    button(if entry.favorite {
-                        "取消收藏"
-                    } else {
-                        "收藏条目"
-                    })
-                    .on_press(Message::ToggleSelectedFavorite)
-                    .style(button::secondary),
-                    button("移到回收站")
-                        .on_press(Message::MoveSelectedToRecycleBin)
-                        .style(button::danger),
+                    button(if entry.favorite { "取消收藏" } else { "收藏条目" })
+                        .on_press(Message::ToggleSelectedFavorite)
+                        .style(button::secondary),
+                    button("移到回收站").on_press(Message::MoveSelectedToRecycleBin).style(button::danger),
                 ]
                 .spacing(8),
             );
@@ -470,294 +557,12 @@ impl App {
     }
 
     fn context_view(&self) -> Element<'_, Message> {
-        let mut content = column![text("条目快捷操作").size(18)]
-            .spacing(12)
-            .width(520);
+        let mut content = column![text("条目快捷操作").size(18)].spacing(12);
         if let Some(entry) = self.selected_entry() {
             content = content.push(self.selection_actions(entry));
         }
         content
-            .push(
-                button("关闭菜单")
-                    .on_press(Message::CloseContext)
-                    .style(button::secondary),
-            )
+            .push(button("关闭菜单").on_press(Message::CloseContext).style(button::secondary))
             .into()
-    }
-
-    fn workspace<'a>(
-        &'a self,
-        title: &'a str,
-        content: impl Into<Element<'a, Message>>,
-    ) -> Element<'a, Message> {
-        column![
-            row![
-                text(title).size(24),
-                Space::new().width(Length::Fill),
-                button("返回列表")
-                    .on_press(Message::CancelPanel)
-                    .style(button::secondary)
-            ]
-            .align_y(Alignment::Center),
-            scrollable(container(content).max_width(900).width(Length::Fill)).height(Length::Fill),
-        ]
-        .spacing(16)
-        .into()
-    }
-
-    fn editor_view<'a>(&'a self, state: &'a EditorState) -> Element<'a, Message> {
-        let form = column![
-            field(
-                "名称 *",
-                "条目名称",
-                &state.name,
-                Message::EditorNameChanged
-            ),
-            field(
-                "网站",
-                "https://example.com",
-                &state.website,
-                Message::EditorWebsiteChanged
-            ),
-            field(
-                "用户名",
-                "账号 / 邮箱",
-                &state.username,
-                Message::EditorUsernameChanged
-            ),
-            text("密码 *").size(13),
-            row![
-                text_input("输入密码", &state.password)
-                    .on_input(Message::EditorPasswordChanged)
-                    .secure(!state.password_visible)
-                    .padding(10),
-                button(if state.password_visible {
-                    "隐藏"
-                } else {
-                    "显示"
-                })
-                .on_press(Message::ToggleEditorPasswordVisible)
-                .style(button::secondary)
-            ]
-            .spacing(8),
-            button("生成 20 位随机密码")
-                .on_press(Message::GeneratePassword)
-                .style(button::secondary),
-            field(
-                "分类",
-                "分类名称",
-                &state.category,
-                Message::EditorCategoryChanged
-            ),
-            text("备注（支持多行）").size(13),
-            text_editor(&state.notes_editor)
-                .on_action(Message::EditorNotesAction)
-                .height(160)
-                .padding(10),
-            checkbox(state.favorite)
-                .label("收藏此条目")
-                .on_toggle(Message::EditorFavoriteChanged),
-        ]
-        .spacing(10);
-        column![
-            text(if state.id.is_some() {
-                "编辑条目"
-            } else {
-                "添加条目"
-            })
-            .size(24),
-            scrollable(card(form)).height(Length::Fill),
-            row![
-                button("保存条目").on_press(Message::SaveEditor).padding(10),
-                button("取消编辑")
-                    .on_press(Message::CancelPanel)
-                    .style(button::secondary)
-                    .padding(10)
-            ]
-            .spacing(10),
-        ]
-        .spacing(16)
-        .into()
-    }
-
-    fn import_view<'a>(
-        &'a self,
-        session: &'a VaultSession,
-        state: &'a ImportState,
-    ) -> Element<'a, Message> {
-        let mut form = column![
-            text("支持 Chrome CSV、旧版 CSV、vault.enc 和 passwords.db。源文件只读。").size(13),
-            field(
-                "导入文件路径",
-                "密码导出文件路径",
-                &state.path,
-                Message::ImportPathChanged
-            ),
-            secret_field(
-                "旧主密码（仅旧版加密格式需要）",
-                &state.legacy_password,
-                Message::ImportLegacyPasswordChanged
-            ),
-            button("分析并预览")
-                .on_press(Message::AnalyzeImport)
-                .padding(10),
-        ]
-        .spacing(14);
-        if let Some(preview) = &state.preview {
-            let summary = preview.summary();
-            form = form
-                .push(text(format!(
-                    "新增 {} · 重复 {} · 更新 {} · 冲突 {} · 本地已删除 {} · 无效 {}",
-                    summary.new,
-                    summary.exact_duplicates,
-                    summary.update_candidates,
-                    summary.conflicts,
-                    summary.locally_deleted,
-                    summary.invalid
-                )))
-                .push(
-                    checkbox(state.apply_updates)
-                        .label("应用更新候选（未本地修改的已导入条目）")
-                        .on_toggle(Message::ImportApplyUpdatesChanged),
-                );
-            let mut unresolved = 0;
-            for (index, row) in preview.rows.iter().enumerate() {
-                match &row.class {
-                    ImportClass::Conflict { existing_ids }
-                    | ImportClass::LocallyDeleted { existing_ids } => {
-                        let choice = state.resolutions.get(&index);
-                        if choice.is_none() {
-                            unresolved += 1;
-                        }
-                        let mut decision = column![
-                            text(format!(
-                                "{}：{} · {}",
-                                if matches!(&row.class, ImportClass::LocallyDeleted { .. }) {
-                                    "本地已删除"
-                                } else {
-                                    "冲突"
-                                },
-                                row.item.name,
-                                row.item.username
-                            )),
-                            row![
-                                button(if matches!(choice, Some(ConflictResolution::KeepLocal)) {
-                                    "已选：保留本地"
-                                } else {
-                                    "保留本地"
-                                })
-                                .on_press(Message::SetImportResolution(
-                                    index,
-                                    ConflictResolution::KeepLocal
-                                ))
-                                .style(button::secondary),
-                                button(if matches!(choice, Some(ConflictResolution::KeepBoth)) {
-                                    "已选：两份都保留"
-                                } else {
-                                    "两份都保留"
-                                })
-                                .on_press(Message::SetImportResolution(
-                                    index,
-                                    ConflictResolution::KeepBoth
-                                ))
-                                .style(button::secondary),
-                            ]
-                            .spacing(8),
-                        ]
-                        .spacing(8);
-                        for id in existing_ids {
-                            if let Some(entry) = session.entry(*id) {
-                                let selected = matches!(choice, Some(ConflictResolution::UseImported(selected)) if selected == id);
-                                decision = decision.push(
-                                    button(text(format!(
-                                        "{}使用导入值覆盖 / 恢复：{}",
-                                        if selected { "已选：" } else { "" },
-                                        entry.name
-                                    )))
-                                    .on_press(Message::SetImportResolution(
-                                        index,
-                                        ConflictResolution::UseImported(*id),
-                                    ))
-                                    .style(button::secondary),
-                                );
-                            }
-                        }
-                        form = form.push(card(decision));
-                    }
-                    ImportClass::UpdateCandidate { .. } => {
-                        form = form.push(text(format!("更新候选：{}", row.item.name)).size(13))
-                    }
-                    _ => {}
-                }
-            }
-            form = form.push(
-                button("执行导入")
-                    .on_press_maybe((unresolved == 0).then_some(Message::ApplyImport))
-                    .padding(10),
-            );
-            if unresolved > 0 {
-                form = form.push(text(format!("还有 {unresolved} 项需要选择处理方式。")));
-            }
-        }
-        self.workspace("导入密码", card(form))
-    }
-
-    fn settings_view<'a>(
-        &'a self,
-        session: &'a VaultSession,
-        state: &'a SettingsState,
-    ) -> Element<'a, Message> {
-        let form = column![
-            card(column![
-                text("外观与安全").size(18),
-                checkbox(self.dark_mode).label("深色模式（默认使用旧版浅色）").on_toggle(Message::DarkModeChanged),
-                checkbox(self.screen_capture_protection_requested).label("启用 Windows 常规截图保护").on_toggle(Message::ScreenCaptureProtectionChanged),
-                text(format!("截图保护：{} · 会话监控：{}", if self.screen_capture_protection_active { "已启用" } else { "未启用" }, if self.security_monitor_ready { "已就绪" } else { "未就绪" })).size(12),
-                text("截图保护不保证阻止所有捕获方式。锁屏或挂起时自动锁定；剪贴板清理能力需实际验证。").size(12),
-            ].spacing(12)),
-            card(column![
-                text("加密备份").size(18),
-                field("备份目标路径", "新的 .pmvault 文件", &state.backup_path, Message::BackupPathChanged),
-                button("创建加密备份").on_press(Message::CreateBackup),
-                text("恢复并替换当前保险库").size(16),
-                field("备份文件路径", "已有备份的完整路径", &state.restore_path, Message::RestorePathChanged),
-                secret_field("备份的主密码", &state.restore_password, Message::RestorePasswordChanged),
-                checkbox(state.confirm_restore).label("确认用备份替换当前保险库（不是合并导入）").on_toggle(Message::ConfirmRestoreChanged),
-                button("恢复备份").on_press_maybe(state.confirm_restore.then_some(Message::RestoreBackup)).style(button::danger),
-            ].spacing(12)),
-            card(column![
-                text("兼容导出：明文 CSV").size(18),
-                field("导出路径", "新的 .csv 文件", &state.csv_path, Message::CsvPathChanged),
-                checkbox(state.confirm_plaintext).label("我理解导出文件中的密码和备注没有加密").on_toggle(Message::ConfirmPlaintextChanged),
-                button("导出明文 CSV").on_press_maybe(state.confirm_plaintext.then_some(Message::ExportPlaintextCsv)).style(button::danger),
-            ].spacing(12)),
-            text(format!("版本 {} · 条目 {} · Revision {}", env!("CARGO_PKG_VERSION"), session.active_entries().count(), session.revision())).size(12),
-            text(format!("保险库：{}", session.path().display())).size(12),
-        ].spacing(16);
-        self.workspace("设置 / 导出 / 备份", form)
-    }
-
-    fn confirmation<'a>(
-        &'a self,
-        title: &'a str,
-        explanation: &'a str,
-        action: Message,
-    ) -> Element<'a, Message> {
-        self.workspace(
-            title,
-            card(
-                column![
-                    text(explanation),
-                    row![
-                        button("确认操作").on_press(action).style(button::danger),
-                        button("取消")
-                            .on_press(Message::CancelPanel)
-                            .style(button::secondary)
-                    ]
-                    .spacing(10)
-                ]
-                .spacing(20),
-            ),
-        )
     }
 }

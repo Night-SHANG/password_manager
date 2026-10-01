@@ -50,6 +50,8 @@ struct App {
     master_password: String,
     confirm_password: String,
     creating: bool,
+    auth_options_open: bool,
+    category_editor_open: bool,
     session: Option<VaultSession>,
     search: String,
     search_id: widget::Id,
@@ -187,9 +189,20 @@ struct RevealedPassword {
     value: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CardAction {
+    CopyUsername,
+    CopyPassword,
+    Favorite,
+    OpenWebsite,
+}
+
 #[derive(Clone)]
 enum Message {
     AuthMode(bool),
+    ToggleAuthOptions,
+    ToggleCategoryEditor,
+    CardAction(Uuid, CardAction),
     VaultPathChanged(String),
     MasterPasswordChanged(String),
     ConfirmPasswordChanged(String),
@@ -272,6 +285,8 @@ impl App {
             master_password: String::new(),
             confirm_password: String::new(),
             creating: false,
+            auth_options_open: false,
+            category_editor_open: false,
             session: None,
             search: String::new(),
             search_id: widget::Id::unique(),
@@ -304,7 +319,7 @@ impl App {
             Theme::custom(
                 "旧版浅色".to_string(),
                 iced::theme::Palette {
-                    background: iced::Color::from_rgb8(243, 244, 246),
+                    background: iced::Color::from_rgb8(248, 249, 250),
                     text: iced::Color::from_rgb8(17, 24, 39),
                     primary: iced::Color::from_rgb8(37, 99, 235),
                     success: iced::Color::from_rgb8(16, 185, 129),
@@ -354,6 +369,33 @@ impl App {
                 self.creating = creating;
                 self.clear_password_fields();
                 self.status.clear();
+            }
+            Message::ToggleAuthOptions => self.auth_options_open = !self.auth_options_open,
+            Message::ToggleCategoryEditor => {
+                self.category_editor_open = !self.category_editor_open;
+            }
+            Message::CardAction(id, action) => {
+                let query = self.search.to_lowercase();
+                let valid = matches!(&self.panel, Panel::Vault)
+                    && self
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.entry(id))
+                        .is_some_and(|entry| self.entry_visible(entry, &query));
+                if !valid {
+                    return Task::none();
+                }
+                if self.selected != Some(id) {
+                    self.revealed = None;
+                }
+                self.selected = Some(id);
+                self.context_open = false;
+                return self.update(match action {
+                    CardAction::CopyUsername => Message::CopyUsername,
+                    CardAction::CopyPassword => Message::CopyPassword,
+                    CardAction::Favorite => Message::ToggleSelectedFavorite,
+                    CardAction::OpenWebsite => Message::OpenWebsite,
+                });
             }
             Message::VaultPathChanged(value) => self.vault_path = value,
             Message::MasterPasswordChanged(value) => {

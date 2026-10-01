@@ -20,6 +20,7 @@ jobs:
     timeout-minutes: 35
     env:
       ICED_TEST_BACKEND: tiny-skia
+      RUST_BACKTRACE: "1"
       EXPECTED_LOCK_SHA256: ${{ inputs.lock_sha256 }}
     steps:
       - uses: actions/checkout@v6
@@ -63,6 +64,16 @@ jobs:
         shell: pwsh
         run: |
           if (Test-Path target/gui-artifacts) { Remove-Item target/gui-artifacts -Recurse -Force }
+          New-Item -ItemType Directory -Force target/gui-artifacts | Out-Null
+          @"
+          Submitted commit: $env:GITHUB_SHA
+          Cargo.lock SHA-256: $env:GUI_LOCK_SHA256
+          Backend: tiny-skia
+          Reference: user-provided legacy card GUI, not the superseded table layout.
+          Captures: headless review evidence, NOT approved golden baselines.
+          Logical sizes do not prove OS DPI/IME/session/clipboard/WDA behavior.
+          See capture-stages.txt for the last BEGIN/END when a scenario panics.
+          "@ | Set-Content target/gui-artifacts/REVIEW-NOTES.txt
           cargo test --lib gui_ --locked -- --ignored --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "GUI tests failed." }
           if ((Get-FileHash Cargo.lock -Algorithm SHA256).Hash -ne $env:GUI_LOCK_SHA256) {
@@ -70,13 +81,6 @@ jobs:
           }
           git diff --exit-code -- . ':(exclude)Cargo.lock'
           if ($LASTEXITCODE -ne 0) { throw "GUI checks changed submitted sources." }
-          @"
-          Submitted commit: $env:GITHUB_SHA
-          Cargo.lock SHA-256: $env:GUI_LOCK_SHA256
-          Backend: tiny-skia
-          Captures: headless review evidence, NOT approved golden baselines.
-          Logical sizes do not prove OS DPI/IME/session/clipboard/WDA behavior.
-          "@ | Set-Content target/gui-artifacts/REVIEW-NOTES.txt
       - name: Retain screenshots and formatter diagnostics
         if: always()
         uses: actions/upload-artifact@v4
