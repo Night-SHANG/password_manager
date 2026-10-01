@@ -119,7 +119,9 @@ fn category_delete_moves_entries_without_deleting_credentials() {
 fn lock_drops_editor_import_preview_and_revealed_state() {
     let (_dir, mut app) = fixture(1);
     let _ = app.update(Message::NewEntry);
-    let _ = app.update(Message::EditorPasswordChanged("synthetic-buffer".to_string()));
+    let _ = app.update(Message::EditorPasswordChanged(
+        "synthetic-buffer".to_string(),
+    ));
     let _ = app.update(Message::Lock);
     assert!(app.session.is_none());
     assert!(matches!(app.panel, Panel::Vault));
@@ -142,11 +144,32 @@ fn card_action_targets_its_id_and_rejects_stale_targets() {
     let _ = app.update(Message::SelectEntry(ids[0]));
     let _ = app.update(Message::CardAction(ids[1], CardAction::Favorite));
     assert_eq!(app.selected, Some(ids[1]));
-    assert!(!app.session.as_ref().unwrap().entry(ids[0]).unwrap().favorite);
-    assert!(app.session.as_ref().unwrap().entry(ids[1]).unwrap().favorite);
+    assert!(
+        !app.session
+            .as_ref()
+            .unwrap()
+            .entry(ids[0])
+            .unwrap()
+            .favorite
+    );
+    assert!(
+        app.session
+            .as_ref()
+            .unwrap()
+            .entry(ids[1])
+            .unwrap()
+            .favorite
+    );
     let _ = app.update(Message::SearchChanged("does-not-match".to_string()));
     let _ = app.update(Message::CardAction(ids[1], CardAction::Favorite));
-    assert!(app.session.as_ref().unwrap().entry(ids[1]).unwrap().favorite);
+    assert!(
+        app.session
+            .as_ref()
+            .unwrap()
+            .entry(ids[1])
+            .unwrap()
+            .favorite
+    );
     let _ = app.update(Message::Lock);
     let _ = app.update(Message::CardAction(ids[1], CardAction::CopyPassword));
     assert!(app.selected.is_none());
@@ -227,7 +250,9 @@ fn gui_cards_search_and_editor_buttons() {
     click(&mut app, "清空");
     click(&mut app, "+ 添加密码");
     let _ = app.update(Message::EditorNameChanged("GUI 新条目".to_string()));
-    let _ = app.update(Message::EditorPasswordChanged("synthetic-gui-only".to_string()));
+    let _ = app.update(Message::EditorPasswordChanged(
+        "synthetic-gui-only".to_string(),
+    ));
     click(&mut app, "保存条目");
     assert!(matches!(&app.panel, Panel::Vault));
     assert_eq!(app.session.as_ref().unwrap().active_entries().count(), 4);
@@ -313,11 +338,19 @@ fn several_hundred_rows_filter_without_revealing_secrets() {
     let (_dir, app) = fixture(500);
     let vault = app.session.as_ref().unwrap();
     assert_eq!(
-        vault.entries().iter().filter(|e| app.entry_visible(e, "")).count(),
+        vault
+            .entries()
+            .iter()
+            .filter(|e| app.entry_visible(e, ""))
+            .count(),
         500
     );
     assert_eq!(
-        vault.entries().iter().filter(|e| app.entry_visible(e, "499")).count(),
+        vault
+            .entries()
+            .iter()
+            .filter(|e| app.entry_visible(e, "499"))
+            .count(),
         1
     );
 }

@@ -1,3 +1,5 @@
+use iced::widget::column;
+
 use super::*;
 
 impl App {
@@ -15,8 +17,7 @@ impl App {
                     .style(button::secondary)
             ]
             .align_y(Alignment::Center),
-            scrollable(container(content).max_width(900).width(Length::Fill))
-                .height(Length::Fill),
+            scrollable(container(content).max_width(900).width(Length::Fill)).height(Length::Fill),
         ]
         .spacing(16)
         .into()
@@ -24,24 +25,48 @@ impl App {
 
     pub(super) fn editor_view<'a>(&'a self, state: &'a EditorState) -> Element<'a, Message> {
         let form = column![
-            field("名称 *", "条目名称", &state.name, Message::EditorNameChanged),
-            field("网站", "https://example.com", &state.website, Message::EditorWebsiteChanged),
-            field("用户名", "账号 / 邮箱", &state.username, Message::EditorUsernameChanged),
+            field(
+                "名称 *",
+                "条目名称",
+                &state.name,
+                Message::EditorNameChanged
+            ),
+            field(
+                "网站",
+                "https://example.com",
+                &state.website,
+                Message::EditorWebsiteChanged
+            ),
+            field(
+                "用户名",
+                "账号 / 邮箱",
+                &state.username,
+                Message::EditorUsernameChanged
+            ),
             text("密码 *").size(13),
             row![
                 text_input("输入密码", &state.password)
                     .on_input(Message::EditorPasswordChanged)
                     .secure(!state.password_visible)
                     .padding(10),
-                button(if state.password_visible { "隐藏" } else { "显示" })
-                    .on_press(Message::ToggleEditorPasswordVisible)
-                    .style(button::secondary)
+                button(if state.password_visible {
+                    "隐藏"
+                } else {
+                    "显示"
+                })
+                .on_press(Message::ToggleEditorPasswordVisible)
+                .style(button::secondary)
             ]
             .spacing(8),
             button("生成 20 位随机密码")
                 .on_press(Message::GeneratePassword)
                 .style(button::secondary),
-            field("分类", "分类名称", &state.category, Message::EditorCategoryChanged),
+            field(
+                "分类",
+                "分类名称",
+                &state.category,
+                Message::EditorCategoryChanged
+            ),
             text("备注（支持多行）").size(13),
             text_editor(&state.notes_editor)
                 .on_action(Message::EditorNotesAction)
@@ -53,7 +78,12 @@ impl App {
         ]
         .spacing(10);
         column![
-            text(if state.id.is_some() { "编辑条目" } else { "添加条目" }).size(24),
+            text(if state.id.is_some() {
+                "编辑条目"
+            } else {
+                "添加条目"
+            })
+            .size(24),
             scrollable(card(form)).height(Length::Fill),
             row![
                 button("保存条目").on_press(Message::SaveEditor).padding(10),
@@ -75,13 +105,20 @@ impl App {
     ) -> Element<'a, Message> {
         let mut form = column![
             text("支持 Chrome CSV、旧版 CSV、vault.enc 和 passwords.db。源文件只读。").size(13),
-            field("导入文件路径", "密码导出文件路径", &state.path, Message::ImportPathChanged),
+            field(
+                "导入文件路径",
+                "密码导出文件路径",
+                &state.path,
+                Message::ImportPathChanged
+            ),
             secret_field(
                 "旧主密码（仅旧版加密格式需要）",
                 &state.legacy_password,
                 Message::ImportLegacyPasswordChanged
             ),
-            button("分析并预览").on_press(Message::AnalyzeImport).padding(10),
+            button("分析并预览")
+                .on_press(Message::AnalyzeImport)
+                .padding(10),
         ]
         .spacing(14);
         if let Some(preview) = &state.preview {

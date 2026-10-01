@@ -1,6 +1,6 @@
 use iced::widget::{
-    Space, button, checkbox, column, container, mouse_area, opaque, row, scrollable, stack,
-    text, text_input,
+    Space, button, checkbox, column, container, mouse_area, opaque, row, scrollable, stack, text,
+    text_input,
 };
 use iced::{Alignment, Color};
 
@@ -181,10 +181,14 @@ impl App {
                 .size(if self.creating { 32 } else { 56 })
                 .width(Length::Fill)
                 .align_x(Alignment::Center),
-            text(if self.creating { "创建密码库" } else { "解锁密码库" })
-                .size(25)
-                .width(Length::Fill)
-                .align_x(Alignment::Center),
+            text(if self.creating {
+                "创建密码库"
+            } else {
+                "解锁密码库"
+            })
+            .size(25)
+            .width(Length::Fill)
+            .align_x(Alignment::Center),
             text(if self.creating {
                 "设置主密码以保护本地数据"
             } else {
@@ -218,10 +222,14 @@ impl App {
         }
         form = form
             .push(
-                button(text(if self.creating { "创建并进入" } else { "解 锁" }))
-                    .on_press(submit)
-                    .padding(14)
-                    .width(Length::Fill),
+                button(text(if self.creating {
+                    "创建并进入"
+                } else {
+                    "解 锁"
+                }))
+                .on_press(submit)
+                .padding(14)
+                .width(Length::Fill),
             )
             .push(
                 row![
@@ -236,9 +244,13 @@ impl App {
             );
         if !self.creating {
             form = form.push(
-                button(if self.auth_options_open { "收起文件位置" } else { "更换保险库文件" })
-                    .on_press(Message::ToggleAuthOptions)
-                    .style(button::text),
+                button(if self.auth_options_open {
+                    "收起文件位置"
+                } else {
+                    "更换保险库文件"
+                })
+                .on_press(Message::ToggleAuthOptions)
+                .style(button::text),
             );
         }
         form = form.push(text("本地加密 · 测试版本，请勿作为唯一密码副本").size(11));
@@ -305,7 +317,11 @@ impl App {
     fn sidebar_view<'a>(&'a self, session: &'a VaultSession) -> Element<'a, Message> {
         let enabled = matches!(&self.panel, Panel::Vault);
         let mut categories = column![
-            self.nav_button("全部".to_string(), NavFilter::All, session.active_entries().count()),
+            self.nav_button(
+                "全部".to_string(),
+                NavFilter::All,
+                session.active_entries().count()
+            ),
             self.nav_button(
                 "收藏".to_string(),
                 NavFilter::Favorites,
@@ -320,11 +336,16 @@ impl App {
         ]
         .spacing(5);
         for name in session.categories() {
-            categories = categories.push(self.nav_button(
-                name.clone(),
-                NavFilter::Category(name.clone()),
-                session.active_entries().filter(|e| &e.category == name).count(),
-            ));
+            categories = categories.push(
+                self.nav_button(
+                    name.clone(),
+                    NavFilter::Category(name.clone()),
+                    session
+                        .active_entries()
+                        .filter(|e| &e.category == name)
+                        .count(),
+                ),
+            );
             if enabled && self.nav == NavFilter::Category(name.clone()) && name != "其他" {
                 categories = categories.push(
                     row![
@@ -453,7 +474,8 @@ impl App {
                     .clip(true),
                 button(text(if entry.favorite { "★" } else { "☆" }).size(20))
                     .on_press_maybe(
-                        (!entry.is_deleted()).then_some(Message::CardAction(id, CardAction::Favorite))
+                        (!entry.is_deleted())
+                            .then_some(Message::CardAction(id, CardAction::Favorite))
                     )
                     .style(button::text)
                     .padding(2),
@@ -487,9 +509,17 @@ impl App {
                     Message::CardAction(id, CardAction::CopyPassword)
                 ),
                 card_button(
-                    if entry.is_deleted() { "操作" } else { "编辑" },
+                    if entry.is_deleted() {
+                        "操作"
+                    } else {
+                        "编辑"
+                    },
                     format!("edit-{id}"),
-                    if entry.is_deleted() { Message::ContextEntry(id) } else { Message::EditEntry(id) }
+                    if entry.is_deleted() {
+                        Message::ContextEntry(id)
+                    } else {
+                        Message::EditEntry(id)
+                    }
                 ),
             ]
             .spacing(8),
@@ -518,12 +548,22 @@ impl App {
     fn selection_actions<'a>(&'a self, entry: &'a EntryRecord) -> Element<'a, Message> {
         let mut actions = column![
             row![
-                button("复制账号").on_press(Message::CopyUsername).style(button::secondary),
-                button("复制密码").on_press(Message::CopyPassword).style(button::secondary),
-                button(if self.revealed.is_some() { "隐藏密码" } else { "显示密码" })
-                    .on_press(Message::ToggleReveal)
+                button("复制账号")
+                    .on_press(Message::CopyUsername)
                     .style(button::secondary),
-                button("打开网页").on_press(Message::OpenWebsite).style(button::secondary),
+                button("复制密码")
+                    .on_press(Message::CopyPassword)
+                    .style(button::secondary),
+                button(if self.revealed.is_some() {
+                    "隐藏密码"
+                } else {
+                    "显示密码"
+                })
+                .on_press(Message::ToggleReveal)
+                .style(button::secondary),
+                button("打开网页")
+                    .on_press(Message::OpenWebsite)
+                    .style(button::secondary),
             ]
             .spacing(8),
         ]
@@ -532,7 +572,9 @@ impl App {
             actions = actions.push(
                 row![
                     button("恢复条目").on_press(Message::RestoreSelected),
-                    button("永久删除").on_press(Message::RequestPermanentDelete).style(button::danger),
+                    button("永久删除")
+                        .on_press(Message::RequestPermanentDelete)
+                        .style(button::danger),
                 ]
                 .spacing(8),
             );
@@ -540,10 +582,16 @@ impl App {
             actions = actions.push(
                 row![
                     button("编辑条目").on_press(Message::EditSelected),
-                    button(if entry.favorite { "取消收藏" } else { "收藏条目" })
-                        .on_press(Message::ToggleSelectedFavorite)
-                        .style(button::secondary),
-                    button("移到回收站").on_press(Message::MoveSelectedToRecycleBin).style(button::danger),
+                    button(if entry.favorite {
+                        "取消收藏"
+                    } else {
+                        "收藏条目"
+                    })
+                    .on_press(Message::ToggleSelectedFavorite)
+                    .style(button::secondary),
+                    button("移到回收站")
+                        .on_press(Message::MoveSelectedToRecycleBin)
+                        .style(button::danger),
                 ]
                 .spacing(8),
             );
@@ -562,7 +610,11 @@ impl App {
             content = content.push(self.selection_actions(entry));
         }
         content
-            .push(button("关闭菜单").on_press(Message::CloseContext).style(button::secondary))
+            .push(
+                button("关闭菜单")
+                    .on_press(Message::CloseContext)
+                    .style(button::secondary),
+            )
             .into()
     }
 }
