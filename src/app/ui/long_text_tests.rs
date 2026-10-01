@@ -123,7 +123,10 @@ fn gui_username_and_website_hover_but_password_does_not() {
         assert!(image.matches_image(&baseline).unwrap());
         std::thread::sleep(std::time::Duration::from_millis(450));
         let hovered = ui.snapshot(&theme).unwrap();
-        assert_eq!(hovered.matches_image(&baseline).unwrap(), field == "password");
+        assert_eq!(
+            hovered.matches_image(&baseline).unwrap(),
+            field == "password"
+        );
         assert!(hovered.matches_image(path(&name)).unwrap());
         assert!(ui.find(SECRET).is_err());
         assert_eq!(ui.into_messages().count(), 0);
