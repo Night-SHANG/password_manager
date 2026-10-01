@@ -8,12 +8,14 @@ fn fixture(count: usize) -> (tempfile::TempDir, App) {
     let path = dir.path().join("synthetic-gui.pmvault");
     let mut vault = VaultSession::create(&path, "gui-synthetic-master-only").unwrap();
     for index in 0..count {
-        vault.add_entry(EntryDraft::login(
-            format!("示例条目 {index:03}"),
-            format!("https://account-{index}.example.test"),
-            format!("synthetic-user-{index}"),
-            "synthetic-not-a-real-password",
-        )).unwrap();
+        vault
+            .add_entry(EntryDraft::login(
+                format!("示例条目 {index:03}"),
+                format!("https://account-{index}.example.test"),
+                format!("synthetic-user-{index}"),
+                "synthetic-not-a-real-password",
+            ))
+            .unwrap();
     }
     vault.save().unwrap();
     app.vault_path = path.display().to_string();
@@ -40,7 +42,9 @@ fn click(app: &mut App, label: &str) {
         ui.into_messages().collect()
     };
     assert!(!messages.is_empty(), "click did not emit a message");
-    for message in messages { let _ = app.update(message); }
+    for message in messages {
+        let _ = app.update(message);
+    }
 }
 
 fn capture(app: &App, name: &str, size: (f32, f32)) {
@@ -49,7 +53,11 @@ fn capture(app: &App, name: &str, size: (f32, f32)) {
     let path = directory.join(format!("{name}-{}x{}.png", size.0 as u32, size.1 as u32));
     // These are review captures, not accepted golden images. CI removes the
     // output directory before this test; generation is NOT a visual approval.
-    simulator(app, size).snapshot(&app.theme()).unwrap().matches_image(path).unwrap();
+    simulator(app, size)
+        .snapshot(&app.theme())
+        .unwrap()
+        .matches_image(path)
+        .unwrap();
 }
 
 #[test]
@@ -85,7 +93,9 @@ fn category_delete_moves_entries_without_deleting_credentials() {
 fn lock_drops_editor_import_preview_and_revealed_state() {
     let (_dir, mut app) = fixture(1);
     let _ = app.update(Message::NewEntry);
-    let _ = app.update(Message::EditorPasswordChanged("synthetic-buffer".to_string()));
+    let _ = app.update(Message::EditorPasswordChanged(
+        "synthetic-buffer".to_string(),
+    ));
     let _ = app.update(Message::Lock);
     assert!(app.session.is_none());
     assert!(matches!(app.panel, Panel::Vault));
@@ -115,7 +125,9 @@ fn gui_table_selection_search_and_editor_buttons() {
     let (_dir, mut app) = fixture(3);
     {
         let mut ui = simulator(&app, (1280.0, 800.0));
-        for heading in ["名称", "网站", "用户名", "密码", "分类"] { assert!(ui.find(heading).is_ok()); }
+        for heading in ["名称", "网站", "用户名", "密码", "分类"] {
+            assert!(ui.find(heading).is_ok());
+        }
         assert!(ui.find("synthetic-not-a-real-password").is_err());
     }
     click(&mut app, "示例条目 001");
@@ -129,7 +141,9 @@ fn gui_table_selection_search_and_editor_buttons() {
         ui.click("取消编辑").unwrap();
         ui.into_messages().collect()
     };
-    for message in messages { let _ = app.update(message); }
+    for message in messages {
+        let _ = app.update(message);
+    }
     assert!(matches!(&app.panel, Panel::Vault));
     let messages: Vec<_> = {
         let mut ui = simulator(&app, (1280.0, 800.0));
@@ -137,7 +151,9 @@ fn gui_table_selection_search_and_editor_buttons() {
         ui.typewrite("002");
         ui.into_messages().collect()
     };
-    for message in messages { let _ = app.update(message); }
+    for message in messages {
+        let _ = app.update(message);
+    }
     assert_eq!(app.search, "002");
     {
         let mut ui = simulator(&app, (1280.0, 800.0));
@@ -149,7 +165,9 @@ fn gui_table_selection_search_and_editor_buttons() {
     click(&mut app, "添加");
     assert!(matches!(&app.panel, Panel::Editor(state) if state.id.is_none()));
     let _ = app.update(Message::EditorNameChanged("GUI 新条目".to_string()));
-    let _ = app.update(Message::EditorPasswordChanged("synthetic-gui-only".to_string()));
+    let _ = app.update(Message::EditorPasswordChanged(
+        "synthetic-gui-only".to_string(),
+    ));
     click(&mut app, "保存条目");
     assert!(matches!(&app.panel, Panel::Vault));
     assert_eq!(app.session.as_ref().unwrap().active_entries().count(), 4);
@@ -183,6 +201,20 @@ fn gui_pages_render_at_supported_logical_sizes() {
 fn several_hundred_rows_filter_without_revealing_secrets() {
     let (_dir, app) = fixture(500);
     let vault = app.session.as_ref().unwrap();
-    assert_eq!(vault.entries().iter().filter(|entry| app.entry_visible(entry, "")).count(), 500);
-    assert_eq!(vault.entries().iter().filter(|entry| app.entry_visible(entry, "499")).count(), 1);
+    assert_eq!(
+        vault
+            .entries()
+            .iter()
+            .filter(|entry| app.entry_visible(entry, ""))
+            .count(),
+        500
+    );
+    assert_eq!(
+        vault
+            .entries()
+            .iter()
+            .filter(|entry| app.entry_visible(entry, "499"))
+            .count(),
+        1
+    );
 }

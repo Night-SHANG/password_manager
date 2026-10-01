@@ -10,7 +10,8 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::domain::EntryRecord;
 use crate::export::{PlaintextExportAcknowledgement, export_plaintext_csv};
 use crate::import::plan::{
-    ConflictResolution, ImportApplyOptions, ImportClass, ImportPreview, apply_preview, build_preview,
+    ConflictResolution, ImportApplyOptions, ImportClass, ImportPreview, apply_preview,
+    build_preview,
 };
 use crate::import::stage_path;
 use crate::platform::{self, SecurityEvent};
@@ -19,9 +20,9 @@ use crate::storage::VaultSession;
 use crate::{AppError, Result};
 
 mod actions;
-mod ui;
 #[cfg(test)]
 mod tests;
+mod ui;
 
 const PASSWORD_CLIPBOARD_TIMEOUT_MS: u32 = 30_000;
 const UI_FONT: Font = Font::with_name("Microsoft YaHei UI");
@@ -160,7 +161,10 @@ impl SettingsState {
     fn from_vault(session: &VaultSession) -> Self {
         let parent = session.path().parent().unwrap_or_else(|| Path::new("."));
         Self {
-            backup_path: parent.join(format!("backup-{}.pmvault", now_unix())).display().to_string(),
+            backup_path: parent
+                .join(format!("backup-{}.pmvault", now_unix()))
+                .display()
+                .to_string(),
             restore_path: String::new(),
             restore_password: String::new(),
             confirm_restore: false,
@@ -254,7 +258,10 @@ enum Message {
 impl std::fmt::Debug for Message {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never expose passwords, clipboard text or editor content in debug output.
-        formatter.debug_tuple("Message").field(&std::mem::discriminant(self)).finish()
+        formatter
+            .debug_tuple("Message")
+            .field(&std::mem::discriminant(self))
+            .finish()
     }
 }
 
@@ -283,47 +290,78 @@ impl App {
     }
 
     fn new() -> (Self, Task<Message>) {
-        (Self::initial(), platform::set_screen_capture_protection(true).map(Message::ScreenCaptureProtectionApplied))
+        (
+            Self::initial(),
+            platform::set_screen_capture_protection(true)
+                .map(Message::ScreenCaptureProtectionApplied),
+        )
     }
 
     fn theme(&self) -> Theme {
         if self.dark_mode {
             Theme::Dark
         } else {
-            Theme::custom("旧版浅色".to_string(), iced::theme::Palette {
-                background: iced::Color::from_rgb8(243, 244, 246),
-                text: iced::Color::from_rgb8(17, 24, 39),
-                primary: iced::Color::from_rgb8(37, 99, 235),
-                success: iced::Color::from_rgb8(16, 185, 129),
-                danger: iced::Color::from_rgb8(239, 68, 68),
-            })
+            Theme::custom(
+                "旧版浅色".to_string(),
+                iced::theme::Palette {
+                    background: iced::Color::from_rgb8(243, 244, 246),
+                    text: iced::Color::from_rgb8(17, 24, 39),
+                    primary: iced::Color::from_rgb8(37, 99, 235),
+                    success: iced::Color::from_rgb8(16, 185, 129),
+                    danger: iced::Color::from_rgb8(239, 68, 68),
+                    warning: iced::theme::Palette::LIGHT.warning,
+                },
+            )
         }
     }
 
     fn subscription(&self) -> Subscription<Message> {
         let hotkeys = keyboard::listen().filter_map(|event| {
-            let keyboard::Event::KeyPressed { key, modifiers, .. } = event else { return None; };
+            let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+                return None;
+            };
             if key == keyboard::Key::Named(keyboard::key::Named::Escape) {
                 return Some(Message::CloseContext);
             }
-            if !modifiers.command() { return None; }
+            if !modifiers.command() {
+                return None;
+            }
             match key.as_ref() {
-                keyboard::Key::Character(value) if value.eq_ignore_ascii_case("f") => Some(Message::FocusSearch),
-                keyboard::Key::Character(value) if value.eq_ignore_ascii_case("n") => Some(Message::NewEntry),
-                keyboard::Key::Character(value) if value.eq_ignore_ascii_case("s") => Some(Message::Save),
-                keyboard::Key::Character(value) if value.eq_ignore_ascii_case("l") => Some(Message::Lock),
+                keyboard::Key::Character(value) if value.eq_ignore_ascii_case("f") => {
+                    Some(Message::FocusSearch)
+                }
+                keyboard::Key::Character(value) if value.eq_ignore_ascii_case("n") => {
+                    Some(Message::NewEntry)
+                }
+                keyboard::Key::Character(value) if value.eq_ignore_ascii_case("s") => {
+                    Some(Message::Save)
+                }
+                keyboard::Key::Character(value) if value.eq_ignore_ascii_case("l") => {
+                    Some(Message::Lock)
+                }
                 _ => None,
             }
         });
-        Subscription::batch([hotkeys, platform::security_events().map(Message::PlatformSecurity)])
+        Subscription::batch([
+            hotkeys,
+            platform::security_events().map(Message::PlatformSecurity),
+        ])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::AuthMode(creating) => { self.creating = creating; self.clear_password_fields(); self.status.clear(); }
+            Message::AuthMode(creating) => {
+                self.creating = creating;
+                self.clear_password_fields();
+                self.status.clear();
+            }
             Message::VaultPathChanged(value) => self.vault_path = value,
-            Message::MasterPasswordChanged(value) => replace_secret(&mut self.master_password, value),
-            Message::ConfirmPasswordChanged(value) => replace_secret(&mut self.confirm_password, value),
+            Message::MasterPasswordChanged(value) => {
+                replace_secret(&mut self.master_password, value)
+            }
+            Message::ConfirmPasswordChanged(value) => {
+                replace_secret(&mut self.confirm_password, value)
+            }
             Message::CreateVault => self.create_vault(),
             Message::OpenVault => self.open_vault(),
             Message::Save => self.save_now(),
@@ -333,32 +371,83 @@ impl App {
                     return operation::focus(self.search_id.clone());
                 }
             }
-            Message::SearchChanged(value) => { self.search = value; self.context_open = false; self.revealed = None; }
-            Message::SetNav(nav) => {
-                self.nav = nav; self.selected = None; self.panel = Panel::Vault;
-                self.context_open = false; self.revealed = None;
+            Message::SearchChanged(value) => {
+                self.search = value;
+                self.context_open = false;
+                self.revealed = None;
             }
-            Message::SelectEntry(id) => { self.selected = Some(id); self.context_open = false; self.revealed = None; }
-            Message::EditEntry(id) => { self.selected = Some(id); self.context_open = false; self.open_editor_for_selected(); }
-            Message::ContextEntry(id) => { self.selected = Some(id); self.context_open = true; self.revealed = None; }
+            Message::SetNav(nav) => {
+                self.nav = nav;
+                self.selected = None;
+                self.panel = Panel::Vault;
+                self.context_open = false;
+                self.revealed = None;
+            }
+            Message::SelectEntry(id) => {
+                self.selected = Some(id);
+                self.context_open = false;
+                self.revealed = None;
+            }
+            Message::EditEntry(id) => {
+                self.selected = Some(id);
+                self.context_open = false;
+                self.open_editor_for_selected();
+            }
+            Message::ContextEntry(id) => {
+                self.selected = Some(id);
+                self.context_open = true;
+                self.revealed = None;
+            }
             Message::CloseContext => self.context_open = false,
             Message::NewEntry => {
-                if self.session.is_some() && !matches!(&self.panel, Panel::Editor(_)) { self.panel = Panel::Editor(EditorState::new()); self.context_open = false; self.revealed = None; }
+                if self.session.is_some() && !matches!(&self.panel, Panel::Editor(_)) {
+                    self.panel = Panel::Editor(EditorState::new());
+                    self.context_open = false;
+                    self.revealed = None;
+                }
             }
             Message::EditSelected => self.open_editor_for_selected(),
-            Message::EditorNameChanged(value) => { if let Panel::Editor(s) = &mut self.panel { s.name = value; } }
-            Message::EditorWebsiteChanged(value) => { if let Panel::Editor(s) = &mut self.panel { s.website = value; } }
-            Message::EditorUsernameChanged(value) => { if let Panel::Editor(s) = &mut self.panel { s.username = value; } }
-            Message::EditorPasswordChanged(value) => { if let Panel::Editor(s) = &mut self.panel { replace_secret(&mut s.password, value); } }
+            Message::EditorNameChanged(value) => {
+                if let Panel::Editor(s) = &mut self.panel {
+                    s.name = value;
+                }
+            }
+            Message::EditorWebsiteChanged(value) => {
+                if let Panel::Editor(s) = &mut self.panel {
+                    s.website = value;
+                }
+            }
+            Message::EditorUsernameChanged(value) => {
+                if let Panel::Editor(s) = &mut self.panel {
+                    s.username = value;
+                }
+            }
+            Message::EditorPasswordChanged(value) => {
+                if let Panel::Editor(s) = &mut self.panel {
+                    replace_secret(&mut s.password, value);
+                }
+            }
             Message::EditorNotesAction(action) => {
                 if let Panel::Editor(s) = &mut self.panel {
                     s.notes_editor.perform(action);
                     replace_secret(&mut s.notes, s.notes_editor.text());
                 }
             }
-            Message::EditorCategoryChanged(value) => { if let Panel::Editor(s) = &mut self.panel { s.category = value; } }
-            Message::EditorFavoriteChanged(value) => { if let Panel::Editor(s) = &mut self.panel { s.favorite = value; } }
-            Message::ToggleEditorPasswordVisible => { if let Panel::Editor(s) = &mut self.panel { s.password_visible = !s.password_visible; } }
+            Message::EditorCategoryChanged(value) => {
+                if let Panel::Editor(s) = &mut self.panel {
+                    s.category = value;
+                }
+            }
+            Message::EditorFavoriteChanged(value) => {
+                if let Panel::Editor(s) = &mut self.panel {
+                    s.favorite = value;
+                }
+            }
+            Message::ToggleEditorPasswordVisible => {
+                if let Panel::Editor(s) = &mut self.panel {
+                    s.password_visible = !s.password_visible;
+                }
+            }
             Message::GeneratePassword => {
                 if let Panel::Editor(s) = &mut self.panel {
                     match generate_password(PasswordGeneratorOptions::default()) {
@@ -368,77 +457,164 @@ impl App {
                 }
             }
             Message::SaveEditor => self.save_editor(),
-            Message::CancelPanel => { self.panel = Panel::Vault; self.context_open = false; self.revealed = None; }
+            Message::CancelPanel => {
+                self.panel = Panel::Vault;
+                self.context_open = false;
+                self.revealed = None;
+            }
             Message::ToggleReveal => self.toggle_reveal(),
             Message::CopyPassword => {
                 self.context_open = false;
-                if let Some(session) = &self.session && let Some(id) = self.selected {
+                if let Some(session) = &self.session
+                    && let Some(id) = self.selected
+                {
                     match session.reveal_secret(id) {
-                        Ok(secret) => return clipboard::write::<Message>(secret.password.clone()).chain(Task::done(Message::PasswordClipboardWritten)),
+                        Ok(secret) => {
+                            return clipboard::write::<Message>(secret.password.clone())
+                                .chain(Task::done(Message::PasswordClipboardWritten));
+                        }
                         Err(error) => self.status = format!("复制失败：{error}"),
                     }
                 }
             }
             Message::CopyUsername => {
                 self.context_open = false;
-                if let Some(entry) = self.selected_entry() { return clipboard::write::<Message>(entry.username.clone()).discard(); }
+                if let Some(entry) = self.selected_entry() {
+                    return clipboard::write::<Message>(entry.username.clone()).discard();
+                }
             }
             Message::OpenWebsite => self.open_selected_website(),
             Message::ToggleSelectedFavorite => self.toggle_selected_favorite(),
             Message::MoveSelectedToRecycleBin => self.recycle_selected(false),
             Message::RestoreSelected => self.recycle_selected(true),
-            Message::RequestPermanentDelete => { if let Some(id) = self.selected { self.context_open = false; self.panel = Panel::DeleteEntry(id); } }
+            Message::RequestPermanentDelete => {
+                if let Some(id) = self.selected {
+                    self.context_open = false;
+                    self.panel = Panel::DeleteEntry(id);
+                }
+            }
             Message::ConfirmPermanentDelete(id) => self.delete_entry(id),
             Message::CategoryNameChanged(value) => self.category_name = value,
             Message::AddCategory => self.add_category(),
             Message::MoveCategory(name, up) => self.move_category(&name, up),
             Message::RequestDeleteCategory(name) => self.panel = Panel::DeleteCategory(name),
             Message::ConfirmDeleteCategory(name) => self.delete_category(&name),
-            Message::OpenImport => { if self.session.is_some() { self.panel = Panel::Import(ImportState::new()); self.revealed = None; } }
-            Message::ImportPathChanged(value) => { if let Panel::Import(s) = &mut self.panel { s.path = value; s.preview = None; s.resolutions.clear(); } }
-            Message::ImportLegacyPasswordChanged(value) => { if let Panel::Import(s) = &mut self.panel { replace_secret(&mut s.legacy_password, value); } }
+            Message::OpenImport => {
+                if self.session.is_some() {
+                    self.panel = Panel::Import(ImportState::new());
+                    self.revealed = None;
+                }
+            }
+            Message::ImportPathChanged(value) => {
+                if let Panel::Import(s) = &mut self.panel {
+                    s.path = value;
+                    s.preview = None;
+                    s.resolutions.clear();
+                }
+            }
+            Message::ImportLegacyPasswordChanged(value) => {
+                if let Panel::Import(s) = &mut self.panel {
+                    replace_secret(&mut s.legacy_password, value);
+                }
+            }
             Message::AnalyzeImport => self.analyze_import(),
-            Message::ImportApplyUpdatesChanged(value) => { if let Panel::Import(s) = &mut self.panel { s.apply_updates = value; } }
-            Message::SetImportResolution(index, resolution) => { if let Panel::Import(s) = &mut self.panel { s.resolutions.insert(index, resolution); } }
+            Message::ImportApplyUpdatesChanged(value) => {
+                if let Panel::Import(s) = &mut self.panel {
+                    s.apply_updates = value;
+                }
+            }
+            Message::SetImportResolution(index, resolution) => {
+                if let Panel::Import(s) = &mut self.panel {
+                    s.resolutions.insert(index, resolution);
+                }
+            }
             Message::ApplyImport => self.apply_import(),
-            Message::OpenSettings => { if let Some(session) = &self.session { self.panel = Panel::Settings(SettingsState::from_vault(session)); self.revealed = None; } }
-            Message::BackupPathChanged(value) => { if let Panel::Settings(s) = &mut self.panel { s.backup_path = value; } }
+            Message::OpenSettings => {
+                if let Some(session) = &self.session {
+                    self.panel = Panel::Settings(SettingsState::from_vault(session));
+                    self.revealed = None;
+                }
+            }
+            Message::BackupPathChanged(value) => {
+                if let Panel::Settings(s) = &mut self.panel {
+                    s.backup_path = value;
+                }
+            }
             Message::CreateBackup => self.create_backup(),
-            Message::RestorePathChanged(value) => { if let Panel::Settings(s) = &mut self.panel { s.restore_path = value; } }
-            Message::RestorePasswordChanged(value) => { if let Panel::Settings(s) = &mut self.panel { replace_secret(&mut s.restore_password, value); } }
-            Message::ConfirmRestoreChanged(value) => { if let Panel::Settings(s) = &mut self.panel { s.confirm_restore = value; } }
+            Message::RestorePathChanged(value) => {
+                if let Panel::Settings(s) = &mut self.panel {
+                    s.restore_path = value;
+                }
+            }
+            Message::RestorePasswordChanged(value) => {
+                if let Panel::Settings(s) = &mut self.panel {
+                    replace_secret(&mut s.restore_password, value);
+                }
+            }
+            Message::ConfirmRestoreChanged(value) => {
+                if let Panel::Settings(s) = &mut self.panel {
+                    s.confirm_restore = value;
+                }
+            }
             Message::RestoreBackup => self.restore_backup(),
-            Message::CsvPathChanged(value) => { if let Panel::Settings(s) = &mut self.panel { s.csv_path = value; } }
-            Message::ConfirmPlaintextChanged(value) => { if let Panel::Settings(s) = &mut self.panel { s.confirm_plaintext = value; } }
+            Message::CsvPathChanged(value) => {
+                if let Panel::Settings(s) = &mut self.panel {
+                    s.csv_path = value;
+                }
+            }
+            Message::ConfirmPlaintextChanged(value) => {
+                if let Panel::Settings(s) = &mut self.panel {
+                    s.confirm_plaintext = value;
+                }
+            }
             Message::ExportPlaintextCsv => self.export_plaintext(),
             Message::DarkModeChanged(value) => self.dark_mode = value,
             Message::ScreenCaptureProtectionChanged(value) => {
                 self.screen_capture_protection_requested = value;
-                return platform::set_screen_capture_protection(value).map(Message::ScreenCaptureProtectionApplied);
+                return platform::set_screen_capture_protection(value)
+                    .map(Message::ScreenCaptureProtectionApplied);
             }
             Message::ScreenCaptureProtectionApplied(result) => match result {
-                Ok(active) => { self.screen_capture_protection_requested = active; self.screen_capture_protection_active = active; }
-                Err(error) => { self.screen_capture_protection_requested = self.screen_capture_protection_active; self.status = format!("截图保护设置失败：{error}"); }
+                Ok(active) => {
+                    self.screen_capture_protection_requested = active;
+                    self.screen_capture_protection_active = active;
+                }
+                Err(error) => {
+                    self.screen_capture_protection_requested =
+                        self.screen_capture_protection_active;
+                    self.status = format!("截图保护设置失败：{error}");
+                }
             },
             Message::PlatformSecurity(event) => match event {
                 SecurityEvent::MonitorReady => {
                     self.security_monitor_ready = true;
-                    if self.screen_capture_protection_requested && !self.screen_capture_protection_active {
-                        return platform::set_screen_capture_protection(true).map(Message::ScreenCaptureProtectionApplied);
+                    if self.screen_capture_protection_requested
+                        && !self.screen_capture_protection_active
+                    {
+                        return platform::set_screen_capture_protection(true)
+                            .map(Message::ScreenCaptureProtectionApplied);
                     }
                 }
-                SecurityEvent::MonitorFailed => { self.security_monitor_ready = false; self.status = "Windows 会话监控不可用，请手动锁定保险库".to_string(); }
+                SecurityEvent::MonitorFailed => {
+                    self.security_monitor_ready = false;
+                    self.status = "Windows 会话监控不可用，请手动锁定保险库".to_string();
+                }
                 SecurityEvent::SessionLocked => self.lock_with_status("Windows 锁屏，保险库已锁定"),
-                SecurityEvent::SessionLoggedOff => self.lock_with_status("Windows 注销，保险库已锁定"),
+                SecurityEvent::SessionLoggedOff => {
+                    self.lock_with_status("Windows 注销，保险库已锁定")
+                }
                 SecurityEvent::SystemSuspending => self.lock_with_status("系统挂起，保险库已锁定"),
-                SecurityEvent::ClipboardCleanupFailed => self.status = "剪贴板清理失败，请手动覆盖剪贴板".to_string(),
+                SecurityEvent::ClipboardCleanupFailed => {
+                    self.status = "剪贴板清理失败，请手动覆盖剪贴板".to_string()
+                }
             },
             Message::PasswordClipboardWritten => {
                 let sequence = platform::clipboard_sequence_number();
-                self.status = match platform::arm_clipboard_clear(sequence, PASSWORD_CLIPBOARD_TIMEOUT_MS) {
-                    Ok(()) => "已发送复制请求，30 秒后尝试条件清理剪贴板".to_string(),
-                    Err(error) => format!("已发送复制请求，自动清理未启用：{error}"),
-                };
+                self.status =
+                    match platform::arm_clipboard_clear(sequence, PASSWORD_CLIPBOARD_TIMEOUT_MS) {
+                        Ok(()) => "已发送复制请求，30 秒后尝试条件清理剪贴板".to_string(),
+                        Err(error) => format!("已发送复制请求，自动清理未启用：{error}"),
+                    };
             }
         }
         Task::none()
@@ -458,5 +634,8 @@ impl Drop for App {
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }

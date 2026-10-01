@@ -23,17 +23,51 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: rust-preflight-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  lock-inputs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      sha256: ${{ steps.prepare.outputs.sha256 }}
+      artifact: ${{ steps.identity.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test dependency preparation policy
+        run: python3 -m unittest discover -s tests/ci -v
+      - name: Prepare one locked dependency snapshot
+        id: prepare
+        run: python3 scripts/prepare-ci-lock.py
+      - name: Identify the immutable lock artifact
+        id: identity
+        env:
+          LOCK_SHA256: ${{ steps.prepare.outputs.sha256 }}
+        run: |
+          printf '%s  Cargo.lock\n' "$LOCK_SHA256" > Cargo.lock.sha256
+          echo "artifact=dependency-lock-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+      - name: Retain the lock snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.identity.outputs.artifact }}
+          path: |
+            Cargo.lock
+            Cargo.lock.sha256
+          if-no-files-found: error
+          retention-days: 14
+
   secret-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-
       - name: Gitleaks
         uses: gitleaks/gitleaks-action@v3
         env:
@@ -41,43 +75,71 @@ jobs:
           GITLEAKS_ENABLE_COMMENTS: "false"
 
   dependency-policy:
+    needs: lock-inputs
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.lock-inputs.outputs.artifact }}
+      - name: Verify the shared dependency snapshot
+        env:
+          LOCK_SHA256: ${{ needs.lock-inputs.outputs.sha256 }}
+        run: |
+          printf '%s  Cargo.lock\n' "$LOCK_SHA256" | sha256sum --check --strict
       - name: Cargo deny
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           rust-version: "1.88.0"
           command: check advisories licenses
-          arguments: --all-features
+          arguments: --all-features --locked
+      - name: Ensure the scanner did not change dependencies
+        env:
+          LOCK_SHA256: ${{ needs.lock-inputs.outputs.sha256 }}
+        run: |
+          printf '%s  Cargo.lock\n' "$LOCK_SHA256" | sha256sum --check --strict
+
+  gui-review:
+    needs: lock-inputs
+    uses: ./.github/workflows/gui-review.yml
+    with:
+      lock_artifact: ${{ needs.lock-inputs.outputs.artifact }}
+      lock_sha256: ${{ needs.lock-inputs.outputs.sha256 }}
 
   preflight:
     needs:
+      - lock-inputs
       - secret-scan
       - dependency-policy
+      - gui-review
     runs-on: windows-latest
     timeout-minutes: 45
     permissions:
       contents: write
-
+    env:
+      LOCK_SHA256: ${{ needs.lock-inputs.outputs.sha256 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
-
+      - name: Receive the checked dependency snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.lock-inputs.outputs.artifact }}
+      - name: Verify the shared dependency snapshot
+        shell: pwsh
+        run: |
+          if ((Get-FileHash Cargo.lock -Algorithm SHA256).Hash -ne $env:LOCK_SHA256) {
+            throw "The dependency snapshot does not match the scanned lockfile."
+          }
       - name: Reject forbidden tracked files
         shell: pwsh
         run: |
@@ -93,23 +155,14 @@ jobs:
             $bad | ForEach-Object { Write-Host "  $_" }
             exit 1
           }
-
-      - name: Bootstrap Cargo.lock
-        shell: pwsh
-        run: cargo generate-lockfile
-
       - name: Format
         run: cargo fmt --all -- --check
-
       - name: Check all targets
         run: cargo check --all-targets --locked
-
       - name: Test
         run: cargo test --all-targets --locked
-
       - name: Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
-
       - name: Reject sensitive logging patterns
         shell: pwsh
         run: |
@@ -124,63 +177,75 @@ jobs:
             $hits | ForEach-Object { Write-Host $_.ToString() }
             exit 1
           }
-
       - name: Build release
         run: cargo build --release --locked
-
       - name: Release binary self-test
         shell: pwsh
         run: |
           & "target/release/password-manager.exe" --self-test
-          if ($LASTEXITCODE -ne 0) {
-            throw "Release binary self-test failed."
-          }
-
+          if ($LASTEXITCODE -ne 0) { throw "Release binary self-test failed." }
       - name: Package Windows release
         shell: pwsh
         run: |
-          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $metadata = cargo metadata --no-deps --locked --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Cargo metadata failed." }
           $version = ($metadata.packages | Where-Object { $_.name -eq "password-manager" } | Select-Object -First 1).version
-          if (-not $version) {
-            throw "Could not resolve package version."
-          }
-
-          & "./scripts/package-windows.ps1"             -ExePath "target/release/password-manager.exe"             -OutDir "dist"             -Version $version             -CommitSha "$env:GITHUB_SHA"
-
+          if (-not $version) { throw "Could not resolve package version." }
+          & "./scripts/package-windows.ps1" -ExePath "target/release/password-manager.exe" -OutDir "dist" -Version $version -CommitSha "$env:GITHUB_SHA"
       - name: Unpack release and smoke again
         shell: pwsh
         run: |
           $unpack = Join-Path $env:RUNNER_TEMP "password-manager-release-smoke"
-          if (Test-Path $unpack) {
-            Remove-Item -Recurse -Force $unpack
-          }
+          if (Test-Path $unpack) { Remove-Item -Recurse -Force $unpack }
           Expand-Archive -Path "dist/password-manager-windows-x64.zip" -DestinationPath $unpack
           & (Join-Path $unpack "password-manager.exe") --self-test
-          if ($LASTEXITCODE -ne 0) {
-            throw "Unpacked release self-test failed."
+          if ($LASTEXITCODE -ne 0) { throw "Unpacked release self-test failed." }
+      - name: Verify and record the exact build inputs
+        shell: pwsh
+        run: |
+          if ((Get-FileHash Cargo.lock -Algorithm SHA256).Hash -ne $env:LOCK_SHA256) {
+            throw "Build steps changed the checked dependency snapshot."
           }
-
+          git diff --exit-code -- . ':(exclude)Cargo.lock'
+          if ($LASTEXITCODE -ne 0) { throw "Build steps changed submitted sources." }
+          Copy-Item Cargo.lock dist/Cargo.lock
+          @"
+          Source commit: $env:GITHUB_SHA
+          Cargo.lock SHA-256: $env:LOCK_SHA256
+          Automated checks passed; GUI captures still require visual review.
+          This is not Windows 10 Level 4 acceptance or a security certification.
+          "@ | Set-Content dist/CI-INPUTS.txt
       - name: Upload validated Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: password-manager-preflight-${{ github.run_number }}
+          name: password-manager-preflight-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
             dist/password-manager.exe
             dist/password-manager-windows-x64.zip
             dist/SHA256SUMS.txt
+            dist/Cargo.lock
+            dist/CI-INPUTS.txt
           if-no-files-found: error
           retention-days: 7
-
-      - name: Commit Cargo.lock after a green bootstrap
+      - name: Commit the lock only after all automated gates pass
         if: github.event_name == 'push' && github.ref == 'refs/heads/dev/rust-rewrite-v1'
         shell: pwsh
         run: |
           if (git status --porcelain -- Cargo.lock) {
+            $remote = git ls-remote --heads origin refs/heads/dev/rust-rewrite-v1
+            if ($LASTEXITCODE -ne 0) { throw "Could not verify the current development branch." }
+            $remoteSha = ($remote -split '\s+')[0]
+            if ($remoteSha -ne $env:GITHUB_SHA) {
+              Write-Host "Development branch moved; the validated lock remains in the artifact."
+              exit 0
+            }
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add Cargo.lock
-            git commit -m "build: lock Rust dependencies"
-            git push
+            git commit -m "build: lock GUI dependencies after verified preflight"
+            if ($LASTEXITCODE -ne 0) { throw "Lockfile commit failed." }
+            git push origin HEAD:refs/heads/dev/rust-rewrite-v1
+            if ($LASTEXITCODE -ne 0) { throw "Lockfile push failed; no force push was attempted." }
           } else {
-            Write-Host "Cargo.lock already committed."
+            Write-Host "The validated Cargo.lock is already committed."
           }
