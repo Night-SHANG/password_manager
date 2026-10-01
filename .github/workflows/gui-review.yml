@@ -1,0 +1,74 @@
+name: GUI Review
+
+on:
+  push:
+    branches: [dev/rust-rewrite-v1]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/gui-review.yml"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gui:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    env:
+      ICED_TEST_BACKEND: tiny-skia
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Resolve development test dependencies
+        run: cargo generate-lockfile
+      - name: Check formatting
+        id: formatting
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+      - name: Collect exact formatter patch without changing test sources
+        if: steps.formatting.outcome == 'failure'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force target/format-review | Out-Null
+          cargo fmt --all
+          if ($LASTEXITCODE -ne 0) { throw "Formatter could not parse source." }
+          git diff --output=target/format-review/rustfmt.patch -- src tests
+          Copy-Item Cargo.lock target/format-review/Cargo.lock
+          git restore --worktree -- src tests
+          if ($LASTEXITCODE -ne 0) { throw "Could not restore submitted sources." }
+      - name: Check all targets
+        run: cargo check --all-targets --locked
+      - name: Headless GUI interactions and review captures
+        shell: pwsh
+        run: |
+          if (Test-Path target/gui-artifacts) { Remove-Item target/gui-artifacts -Recurse -Force }
+          cargo test --lib gui_ --locked -- --ignored --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "GUI tests failed." }
+          @"
+          Submitted commit: $env:GITHUB_SHA
+          Backend: tiny-skia
+          Captures: headless review evidence, NOT approved golden baselines.
+          Logical sizes do not prove OS DPI/IME/session/clipboard/WDA behavior.
+          "@ | Set-Content target/gui-artifacts/REVIEW-NOTES.txt
+      - name: Retain screenshots and formatter diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-review-${{ github.run_number }}
+          path: |
+            target/gui-artifacts/**
+            target/format-review/**
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Enforce format outcome
+        if: always() && steps.formatting.outcome != 'success'
+        shell: pwsh
+        run: throw "Formatting is a failing gate. Review artifact contains the exact formatter patch."
