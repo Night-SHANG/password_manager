@@ -1,12 +1,15 @@
 use iced::widget::{
     Space, button, checkbox, column, container, mouse_area, opaque, row, scrollable, stack, text,
-    text_input,
+    text_input, tooltip,
 };
 use iced::{Alignment, Color};
 
 use super::*;
 
 mod forms;
+
+#[cfg(test)]
+mod long_text_tests;
 
 const SIDEBAR_WIDTH: f32 = 250.0;
 const CARD_WIDTH: f32 = 272.0;
@@ -108,6 +111,64 @@ fn card_line<'a>(label: &'a str, value: &'a str) -> Element<'a, Message> {
     .into()
 }
 
+// Only borrowed, already-unlocked metadata is passed here. Passwords and notes
+// never enter a hover widget. Very long values have a scrollable context view.
+fn metadata_hint<'a>(
+    content: impl Into<Element<'a, Message>>,
+    value: &'a str,
+) -> Element<'a, Message> {
+    tooltip(
+        content,
+        column![
+            container(
+                text(value)
+                    .size(13)
+                    .wrapping(text::Wrapping::WordOrGlyph)
+                    .width(Length::Fill)
+            )
+            .max_height(160)
+            .clip(true),
+            text("右键打开条目操作，滚动查看完整内容").size(11),
+        ]
+        .spacing(8)
+        .width(340),
+        tooltip::Position::Bottom,
+    )
+    .gap(6)
+    .padding(12)
+    .delay(std::time::Duration::from_millis(350))
+    .snap_within_viewport(true)
+    .style(surface)
+    .into()
+}
+
+fn metadata_details(entry: &EntryRecord) -> Element<'_, Message> {
+    let mut fields = column![].spacing(12).width(Length::Fill);
+    for (id, label, value) in [
+        ("name", "名称", entry.name.as_str()),
+        ("username", "账号", entry.username.as_str()),
+        ("website", "网址", entry.website.as_str()),
+        ("category", "分类", entry.category.as_str()),
+    ] {
+        fields = fields.push(
+            container(
+                column![
+                    text(label).size(12),
+                    text(value)
+                        .size(14)
+                        .wrapping(text::Wrapping::WordOrGlyph)
+                        .width(Length::Fill),
+                ]
+                .spacing(4)
+                .width(Length::Fill),
+            )
+            .id(format!("context-{id}"))
+            .width(Length::Fill),
+        );
+    }
+    fields.into()
+}
+
 impl App {
     pub(super) fn view(&self) -> Element<'_, Message> {
         let Some(session) = &self.session else {
@@ -152,10 +213,13 @@ impl App {
                 opaque(
                     container(
                         container(self.context_view())
+                            .id("context-panel")
                             .padding(24)
                             .width(560)
+                            .height(520)
                             .style(surface)
                     )
+                    .padding(24)
                     .center_x(Length::Fill)
                     .center_y(Length::Fill)
                     .style(|_| container::Style {
@@ -469,9 +533,13 @@ impl App {
         let selected = self.selected == Some(id);
         let content = column![
             row![
-                container(text(&entry.name).size(17).wrapping(text::Wrapping::None))
-                    .width(Length::Fill)
-                    .clip(true),
+                metadata_hint(
+                    container(text(&entry.name).size(17).wrapping(text::Wrapping::None))
+                        .id(format!("card-name-{id}"))
+                        .width(Length::Fill)
+                        .clip(true),
+                    &entry.name,
+                ),
                 button(text(if entry.favorite { "★" } else { "☆" }).size(20))
                     .on_press_maybe(
                         (!entry.is_deleted())
@@ -481,18 +549,25 @@ impl App {
                     .padding(2),
             ]
             .align_y(Alignment::Center),
-            card_line("账号：", &entry.username),
-            card_line("密码：", "••••••••"),
+            metadata_hint(
+                container(card_line("账号：", &entry.username)).id(format!("card-username-{id}")),
+                &entry.username,
+            ),
+            container(card_line("密码：", "••••••••")).id(format!("card-password-{id}")),
             row![
                 text("网址：").size(13).width(42),
-                container(
-                    button(text(&entry.website).size(13).wrapping(text::Wrapping::None))
-                        .on_press(Message::CardAction(id, CardAction::OpenWebsite))
-                        .style(button::text)
-                        .padding(0)
-                )
-                .width(Length::Fill)
-                .clip(true),
+                metadata_hint(
+                    container(
+                        button(text(&entry.website).size(13).wrapping(text::Wrapping::None))
+                            .on_press(Message::CardAction(id, CardAction::OpenWebsite))
+                            .style(button::text)
+                            .padding(0)
+                    )
+                    .id(format!("card-website-{id}"))
+                    .width(Length::Fill)
+                    .clip(true),
+                    &entry.website,
+                ),
             ]
             .height(24)
             .align_y(Alignment::Center),
@@ -596,18 +671,36 @@ impl App {
                 .spacing(8),
             );
         }
-        if let Some(secret) = &self.revealed
-            && secret.entry_id == entry.id
-        {
-            actions = actions.push(text(secret.value.as_str()).size(14));
-        }
         actions.into()
     }
 
     fn context_view(&self) -> Element<'_, Message> {
         let mut content = column![text("条目快捷操作").size(18)].spacing(12);
         if let Some(entry) = self.selected_entry() {
-            content = content.push(self.selection_actions(entry));
+            let mut details = column![].spacing(12).width(Length::Fill);
+            if let Some(secret) = &self.revealed
+                && secret.entry_id == entry.id
+            {
+                details = details.push(
+                    column![
+                        text("密码（已显式显示）").size(12),
+                        text(secret.value.as_str())
+                            .size(14)
+                            .wrapping(text::Wrapping::WordOrGlyph)
+                            .width(Length::Fill),
+                    ]
+                    .spacing(4),
+                );
+            }
+            details = details.push(metadata_details(entry));
+            content = content
+                .push(
+                    container(scrollable(details).height(Length::Fill))
+                        .id("context-details")
+                        .width(Length::Fill)
+                        .height(Length::Fill),
+                )
+                .push(self.selection_actions(entry));
         }
         content
             .push(
