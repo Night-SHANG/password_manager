@@ -299,9 +299,9 @@ enum Message {
     ImportPathChanged(String),
     ImportLegacyPasswordChanged(String),
     AnalyzeImport,
-    ImportApplyUpdatesChanged(bool),
-    SetImportResolution(usize, ConflictResolution),
-    ApplyImport,
+    ImportApplyUpdatesChanged(Uuid, bool),
+    SetImportResolution(Uuid, usize, ConflictResolution),
+    ApplyImport(Uuid),
     OpenSettings,
     BackupPathChanged(String),
     CreateBackup,
@@ -452,7 +452,7 @@ impl App {
                 Message::CreateVault
                     | Message::OpenVault
                     | Message::AnalyzeImport
-                    | Message::ApplyImport
+                    | Message::ApplyImport(_)
                     | Message::CreateBackup
                     | Message::RestoreBackup
                     | Message::ExportPlaintextCsv
@@ -483,7 +483,7 @@ impl App {
                 | Message::CreateVault
                 | Message::OpenVault
                 | Message::AnalyzeImport
-                | Message::ApplyImport
+                | Message::ApplyImport(_)
                 | Message::CreateBackup
                 | Message::RestoreBackup
                 | Message::ExportPlaintextCsv
@@ -785,6 +785,7 @@ impl App {
                     s.path = value;
                     s.preview = None;
                     s.resolutions.clear();
+                    s.apply_updates = true;
                     s.legacy_password.zeroize();
                     s.legacy_password.clear();
                 }
@@ -795,17 +796,23 @@ impl App {
                 }
             }
             Message::AnalyzeImport => self.analyze_import(),
-            Message::ImportApplyUpdatesChanged(value) => {
-                if let Panel::Import(s) = &mut self.panel {
+            Message::ImportApplyUpdatesChanged(preview_id, value) => {
+                if let Panel::Import(s) = &mut self.panel
+                    && s.preview.as_ref().is_some_and(|p| p.id() == preview_id)
+                {
                     s.apply_updates = value;
                 }
             }
-            Message::SetImportResolution(index, resolution) => {
-                if let Panel::Import(s) = &mut self.panel {
+            Message::SetImportResolution(preview_id, index, resolution) => {
+                if let Panel::Import(s) = &mut self.panel
+                    && s.preview.as_ref().is_some_and(|p| {
+                        p.id() == preview_id && p.allows_resolution(index, &resolution)
+                    })
+                {
                     s.resolutions.insert(index, resolution);
                 }
             }
-            Message::ApplyImport => self.apply_import(),
+            Message::ApplyImport(preview_id) => self.apply_import(preview_id),
             Message::OpenSettings => {
                 if let Some(session) = &self.session {
                     self.panel = Panel::Settings(SettingsState::from_vault(session));

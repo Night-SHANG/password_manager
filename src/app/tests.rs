@@ -914,3 +914,266 @@ fn gui_password_cut_batches_preserve_uncopied_draft() {
         "masked input permitted copy or cut"
     );
 }
+
+fn staged_import_fixture() -> (tempfile::TempDir, App) {
+    let (dir, mut app) = fixture(0);
+    let source = dir.path().join("synthetic-import.csv");
+    std::fs::write(
+        &source,
+        "name,url,username,password,note\nSynthetic,https://synthetic.example.test,user,one,note\n",
+    )
+    .unwrap();
+    let _ = app.update(Message::OpenImport);
+    let _ = app.update(Message::ImportPathChanged(source.display().to_string()));
+    let _ = app.update(Message::AnalyzeImport);
+    (dir, app)
+}
+
+#[test]
+fn stale_import_events_do_not_target_reanalyzed_preview() {
+    let (_dir, mut app) = staged_import_fixture();
+    let Panel::Import(state) = &app.panel else {
+        panic!("missing import panel")
+    };
+    let old_id = state.preview.as_ref().unwrap().id();
+    let old_apply = Message::ApplyImport(old_id);
+    let old_toggle = Message::ImportApplyUpdatesChanged(old_id, false);
+    let old_decision = Message::SetImportResolution(old_id, 0, ConflictResolution::KeepBoth);
+    let _ = app.update(Message::AnalyzeImport);
+    let _ = app.update(old_toggle);
+    let _ = app.update(old_decision);
+    let Panel::Import(state) = &app.panel else {
+        panic!("missing import panel")
+    };
+    assert!(state.apply_updates);
+    assert!(state.resolutions.is_empty());
+    let _ = app.update(old_apply);
+    assert!(app.session.as_ref().unwrap().entries().is_empty());
+}
+
+#[test]
+fn import_path_navigation_and_lock_discard_staged_preview_and_decisions() {
+    for transition in 0..3 {
+        let (_dir, mut app) = staged_import_fixture();
+        let Panel::Import(state) = &app.panel else {
+            panic!("missing import panel")
+        };
+        let old_id = state.preview.as_ref().unwrap().id();
+        match transition {
+            0 => {
+                let _ = app.update(Message::ImportPathChanged("other.csv".into()));
+            }
+            1 => {
+                let _ = app.update(Message::CancelPanel);
+                let _ = app.update(Message::OpenImport);
+            }
+            _ => {
+                let _ = app.update(Message::Lock);
+            }
+        }
+        let _ = app.update(Message::SetImportResolution(
+            old_id,
+            0,
+            ConflictResolution::KeepBoth,
+        ));
+        let _ = app.update(Message::ImportApplyUpdatesChanged(old_id, false));
+        let _ = app.update(Message::ApplyImport(old_id));
+        if let Panel::Import(state) = &app.panel {
+            assert!(state.preview.is_none());
+            assert!(state.resolutions.is_empty());
+            assert!(state.apply_updates);
+        } else {
+            assert!(app.session.is_none());
+        }
+        if let Some(vault) = &app.session {
+            assert!(vault.entries().is_empty());
+        }
+    }
+}
+
+#[test]
+fn current_import_events_apply_once_and_invalid_choices_are_ignored() {
+    let (_dir, mut app) = staged_import_fixture();
+    let Panel::Import(state) = &app.panel else {
+        panic!("missing import panel")
+    };
+    let id = state.preview.as_ref().unwrap().id();
+    let _ = app.update(Message::SetImportResolution(
+        id,
+        0,
+        ConflictResolution::KeepBoth,
+    ));
+    let _ = app.update(Message::SetImportResolution(
+        id,
+        99,
+        ConflictResolution::KeepLocal,
+    ));
+    let Panel::Import(state) = &app.panel else {
+        panic!("missing import panel")
+    };
+    assert!(state.resolutions.is_empty());
+    let _ = app.update(Message::ApplyImport(id));
+    let Panel::Import(state) = &app.panel else {
+        panic!("missing import panel")
+    };
+    assert!(state.preview.is_none());
+    assert!(state.resolutions.is_empty());
+    let vault = app.session.as_ref().unwrap();
+    assert_eq!(vault.entries().len(), 1);
+    let revision = vault.revision();
+    let _ = app.update(Message::ApplyImport(id));
+    assert_eq!(app.session.as_ref().unwrap().revision(), revision);
+    assert!(app.revealed.is_none());
+}
+
+#[test]
+fn reanalysis_and_path_edits_reset_previous_preview_options() {
+    for path_edit in [false, true] {
+        let (_dir, mut app) = staged_import_fixture();
+        let Panel::Import(state) = &app.panel else {
+            panic!("missing import panel")
+        };
+        let id = state.preview.as_ref().unwrap().id();
+        let _ = app.update(Message::ImportApplyUpdatesChanged(id, false));
+        let Panel::Import(state) = &app.panel else {
+            panic!("missing import panel")
+        };
+        assert!(!state.apply_updates);
+        let _ = app.update(if path_edit {
+            Message::ImportPathChanged("other.csv".into())
+        } else {
+            Message::AnalyzeImport
+        });
+        let Panel::Import(state) = &app.panel else {
+            panic!("missing import panel")
+        };
+        assert!(state.apply_updates);
+        assert!(state.resolutions.is_empty());
+    }
+}
+
+fn import_choice(
+    index: usize,
+    label: &str,
+) -> impl selector::Selector<Output = selector::Target> + Send + '_ {
+    let mut seen = 0;
+    move |candidate: selector::Candidate<'_>| {
+        if matches!(&candidate, selector::Candidate::Text { content, .. } if *content == label) {
+            let matches = seen == index;
+            seen += 1;
+            if matches {
+                return Some(selector::Target::from(candidate));
+            }
+        }
+        None
+    }
+}
+
+#[test]
+#[ignore = "Headless UI suite; run explicitly with the tiny-skia backend in CI"]
+fn gui_import_source_duplicates_and_independent_conflict_choices() {
+    for size in SIZES {
+        let (dir, mut app) = fixture(0);
+        let source = dir.path().join("synthetic-decisions.csv");
+        std::fs::write(
+            &source,
+            concat!(
+                "name,url,username,password,note\n",
+                "Synthetic,https://decisions.example.test,user,synthetic-first,note\n",
+                "Synthetic,https://decisions.example.test,user,synthetic-second,note\n",
+                "Synthetic,https://decisions.example.test,user,synthetic-second,note\n"
+            ),
+        )
+        .unwrap();
+        let _ = app.update(Message::OpenImport);
+        let _ = app.update(Message::ImportPathChanged(source.display().to_string()));
+        let _ = app.update(Message::AnalyzeImport);
+        let Panel::Import(state) = &app.panel else {
+            panic!("missing import panel")
+        };
+        let preview = state.preview.as_ref().unwrap();
+        let preview_id = preview.id();
+        assert_eq!(preview.summary().source_duplicates, 1);
+        assert_eq!(preview.summary().conflicts, 2);
+        assert!(preview.rows()[..2].iter().all(|row| matches!(row.class(), ImportClass::Conflict { existing_ids } if existing_ids.is_empty())));
+        {
+            let mut ui = simulator(&app, size);
+            let stats =
+                "新增 0 · 已有重复 0 · 源内重复 1 · 更新 0 · 冲突 2 · 本地已删除 0 · 无效 0";
+            scroll_picker_into_view(&mut ui, stats, size);
+            let target = ui.find(stats).unwrap();
+            let visible = target
+                .visible_bounds()
+                .expect("source duplicate statistics are hidden");
+            assert!((visible.height - target.bounds().height).abs() < 0.1);
+            assert!(visible.x >= 0.0 && visible.x + visible.width <= size.0);
+        }
+        capture(&app, "import-source-conflicts", size);
+        for (index, label, resolution) in [
+            (0, "跳过此行", ConflictResolution::KeepLocal),
+            (1, "导入为独立条目", ConflictResolution::KeepBoth),
+        ] {
+            let messages = {
+                let mut ui = simulator(&app, size);
+                assert!(ui.find("synthetic-first").is_err());
+                assert!(ui.find("synthetic-second").is_err());
+                let bounds = ui.find(import_choice(index, label)).unwrap().bounds();
+                let amount = (bounds.center_y() - size.1 / 2.0).max(0.0);
+                ui.point_at(iced::Point::new(size.0 - 100.0, size.1 / 2.0));
+                ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                    delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -amount },
+                })]);
+                let target = ui.find(import_choice(index, label)).unwrap();
+                let visible = target.visible_bounds().expect("import choice is hidden");
+                assert!((visible.height - target.bounds().height).abs() < 0.1);
+                assert!(visible.x >= 0.0 && visible.x + visible.width <= size.0);
+                assert!(visible.y >= 0.0 && visible.y + visible.height <= size.1);
+                ui.snapshot(&app.theme())
+                    .unwrap()
+                    .matches_image(format!(
+                        "target/gui-artifacts/import-choice-{index}-{}x{}.png",
+                        size.0 as u32, size.1 as u32
+                    ))
+                    .unwrap();
+                ui.click(import_choice(index, label)).unwrap();
+                ui.into_messages().collect::<Vec<_>>()
+            };
+            assert!(messages.iter().any(|message| matches!(message, Message::SetImportResolution(id, row, actual) if *id == preview_id && *row == index && actual == &resolution)));
+            apply_messages(&mut app, messages);
+            let Panel::Import(state) = &app.panel else {
+                panic!("missing import panel")
+            };
+            assert_eq!(state.resolutions.get(&index), Some(&resolution));
+            assert_eq!(
+                state.preview.as_ref().unwrap().summary().source_duplicates,
+                1
+            );
+        }
+        capture(&app, "import-source-conflicts-resolved", size);
+        let messages = {
+            let mut ui = simulator(&app, size);
+            scroll_picker_into_view(&mut ui, "执行导入", size);
+            assert!(ui.find("执行导入").unwrap().visible_bounds().is_some());
+            ui.click("执行导入").unwrap();
+            ui.into_messages().collect::<Vec<_>>()
+        };
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message, Message::ApplyImport(id) if *id == preview_id))
+        );
+        apply_messages(&mut app, messages);
+        let vault = app.session.as_ref().unwrap();
+        assert_eq!(vault.entries().len(), 1);
+        assert_eq!(
+            vault.reveal_secret(vault.entries()[0].id).unwrap().password,
+            "synthetic-second"
+        );
+        let Panel::Import(state) = &app.panel else {
+            panic!("missing import panel")
+        };
+        assert!(state.preview.is_none());
+        assert!(state.resolutions.is_empty());
+        assert!(app.revealed.is_none());
+    }
+}

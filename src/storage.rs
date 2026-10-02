@@ -43,6 +43,8 @@ struct VaultFile {
 }
 
 pub struct VaultSession {
+    instance_id: Uuid,
+    import_epoch: Uuid,
     path: PathBuf,
     header: PublicHeader,
     body: VaultBody,
@@ -100,6 +102,8 @@ impl VaultSession {
         verify_encoded_bytes(&persisted, &header, &body, &keys)?;
 
         Ok(Self {
+            instance_id: Uuid::new_v4(),
+            import_epoch: Uuid::new_v4(),
             path,
             header,
             body,
@@ -141,12 +145,24 @@ impl VaultSession {
         }
 
         Ok(Self {
+            instance_id: Uuid::new_v4(),
+            import_epoch: Uuid::new_v4(),
             path,
             header: file.header,
             body,
             keys,
             source_hash: security::sha256(&bytes),
         })
+    }
+
+    pub(crate) fn import_binding(&self) -> (Uuid, Uuid) {
+        (self.instance_id, self.import_epoch)
+    }
+
+    pub(crate) fn consume_import_preview(&mut self) {
+        // Successful no-op/deferred commits consume previews too. In memory
+        // only: reopening always gets a different session binding.
+        self.import_epoch = Uuid::new_v4();
     }
 
     pub fn path(&self) -> &Path {
@@ -379,6 +395,31 @@ impl VaultSession {
             return Err(AppError::ExternalChange);
         }
         drop(verified);
+
+        if !overwrite {
+            let temp = tempfile::TempPath::from_path(temp_path_for(destination));
+            write_temp_file(&temp, &bytes)?;
+            platform::atomic_create_new(destination, temp)?;
+            #[cfg(test)]
+            tests::run_after_publish_hook();
+
+            return match Self::open(destination.to_path_buf(), master_password) {
+                Ok(restored)
+                    if restored.vault_id() == expected_id
+                        && restored.revision() == expected_revision
+                        && restored.source_hash == expected_hash =>
+                {
+                    Ok(())
+                }
+                Ok(_) | Err(_) => {
+                    // Another writer may own the published path now. Never
+                    // remove or replace a destination of unproven ownership.
+                    Err(AppError::InvalidVault(
+                        "restored encrypted backup failed verification",
+                    ))
+                }
+            };
+        }
 
         let temp = temp_path_for(destination);
         write_temp_file(&temp, &bytes)?;
@@ -758,6 +799,163 @@ mod tests {
         assert!(matches!(result, Err(AppError::AlreadyExists)));
         assert_eq!(fs::read(&source).unwrap(), original);
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn restore_preserves_destination_created_before_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.pmvault");
+        let destination = dir.path().join("restored.pmvault");
+        VaultSession::create(&source, "synthetic-master").unwrap();
+        let original = fs::read(&source).unwrap();
+        create_competing_destination_before_publish(destination.clone());
+
+        let result = VaultSession::restore_encrypted_backup(
+            &source,
+            &destination,
+            "synthetic-master",
+            false,
+        );
+
+        assert_eq!(fs::read(&destination).unwrap(), b"another writer's file");
+        assert!(matches!(result, Err(AppError::AlreadyExists)));
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn restore_preserves_directory_created_before_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.pmvault");
+        let destination = dir.path().join("restored.pmvault");
+        VaultSession::create(&source, "synthetic-master").unwrap();
+        let original = fs::read(&source).unwrap();
+        let competing_directory = destination.clone();
+        BEFORE_PUBLISH.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert!(!competing_directory.exists());
+                fs::create_dir(&competing_directory).unwrap();
+                fs::write(competing_directory.join("keep.txt"), b"keep").unwrap();
+            }));
+        });
+
+        let result = VaultSession::restore_encrypted_backup(
+            &source,
+            &destination,
+            "synthetic-master",
+            false,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(destination.join("keep.txt")).unwrap(), b"keep");
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_preserves_dangling_symlink_created_before_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.pmvault");
+        let destination = dir.path().join("restored.pmvault");
+        let link_target = dir.path().join("missing.pmvault");
+        VaultSession::create(&source, "synthetic-master").unwrap();
+        let original = fs::read(&source).unwrap();
+        let competing_link = destination.clone();
+        let competing_link_target = link_target.clone();
+        BEFORE_PUBLISH.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert!(!competing_link.exists());
+                std::os::unix::fs::symlink(competing_link_target, competing_link).unwrap();
+            }));
+        });
+
+        let result = VaultSession::restore_encrypted_backup(
+            &source,
+            &destination,
+            "synthetic-master",
+            false,
+        );
+
+        assert!(matches!(result, Err(AppError::AlreadyExists)));
+        assert_eq!(fs::read_link(destination).unwrap(), link_target);
+        assert!(!link_target.exists());
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn restore_preserves_destination_replaced_after_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.pmvault");
+        let destination = dir.path().join("restored.pmvault");
+        VaultSession::create(&source, "synthetic-master").unwrap();
+        let original = fs::read(&source).unwrap();
+        replace_destination_after_publish(destination.clone());
+
+        let result = VaultSession::restore_encrypted_backup(
+            &source,
+            &destination,
+            "synthetic-master",
+            false,
+        );
+
+        assert!(matches!(result, Err(AppError::InvalidVault(_))));
+        assert_eq!(
+            fs::read(destination).unwrap(),
+            b"another writer's replacement"
+        );
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    fn assert_restore_preserves_valid_replacement_after_publish(change_body: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.pmvault");
+        let destination = dir.path().join("restored.pmvault");
+        let competing = dir.path().join("competing.pmvault");
+        let vault = VaultSession::create(&source, "synthetic-master").unwrap();
+        let original = fs::read(&source).unwrap();
+        let mut competing_body = vault.body.clone();
+        if change_body {
+            competing_body.categories.push("Another writer".to_string());
+        }
+        let competing_bytes = encode_file(&vault.header, &competing_body, &vault.keys).unwrap();
+        assert_ne!(competing_bytes, original);
+        fs::write(&competing, &competing_bytes).unwrap();
+        let competing_vault = VaultSession::open(&competing, "synthetic-master").unwrap();
+        assert_eq!(competing_vault.vault_id(), vault.vault_id());
+        assert_eq!(competing_vault.revision(), vault.revision());
+        assert_eq!(competing_vault.body, competing_body);
+        let competing_destination = destination.clone();
+        AFTER_PUBLISH.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert!(competing_destination.exists());
+                platform::atomic_replace(&competing_destination, &competing, None).unwrap();
+            }));
+        });
+
+        let result = VaultSession::restore_encrypted_backup(
+            &source,
+            &destination,
+            "synthetic-master",
+            false,
+        );
+
+        assert!(matches!(result, Err(AppError::InvalidVault(_))));
+        assert_eq!(fs::read(destination).unwrap(), competing_bytes);
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn restore_rejects_same_identity_and_revision_divergent_contents_after_publish() {
+        assert_restore_preserves_valid_replacement_after_publish(true);
+    }
+
+    #[test]
+    fn restore_rejects_reencrypted_same_contents_after_publish() {
+        assert_restore_preserves_valid_replacement_after_publish(false);
     }
 
     #[test]

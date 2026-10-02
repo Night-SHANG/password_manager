@@ -7,6 +7,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::security::sha256;
@@ -14,7 +15,7 @@ use crate::{AppError, Result};
 
 pub const MAX_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct NormalizedImportItem {
     pub provider: String,
     pub source_stable_id: Option<String>,
@@ -115,23 +116,30 @@ pub(crate) fn content_fingerprint(
     category: &str,
     favorite: bool,
 ) -> [u8; 32] {
-    let favorite_text = if favorite { "1" } else { "0" };
-    let mut canonical = Vec::new();
-
-    for value in [
-        name,
-        website,
-        username,
-        password,
-        notes,
-        category,
-        favorite_text,
-    ] {
-        canonical.extend_from_slice(value.as_bytes());
-        canonical.push(0x1f);
+    let mut hash = Sha256::new();
+    hash.update(b"password-manager:import-content:v2\0");
+    for value in [name, website, username, password, notes, category] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
     }
+    hash.update([u8::from(favorite)]);
+    hash.finalize().into()
+}
 
-    sha256(&canonical)
+// The old delimiter encoding is usable only for unambiguous current content.
+// A local edit can otherwise retain an old digest by moving a delimiter across
+// a field boundary. Stream both encodings without allocating plaintext copies.
+pub(crate) fn compatible_legacy_fingerprint(fields: [&str; 6], favorite: bool) -> Option<[u8; 32]> {
+    if fields.iter().any(|value| value.contains('\u{1f}')) {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    for value in fields {
+        hash.update(value.as_bytes());
+        hash.update([0x1f]);
+    }
+    hash.update(if favorite { b"1\x1f" } else { b"0\x1f" });
+    Some(hash.finalize().into())
 }
 
 pub(crate) fn weak_identity_key(website: &str, username: &str) -> (String, String) {
@@ -167,4 +175,17 @@ fn looks_like_sqlite(path: &Path) -> Result<bool> {
         .read(&mut header)
         .map_err(|error| AppError::io(path.to_path_buf(), error))?;
     Ok(read == header.len() && &header == b"SQLite format 3\0")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_notes_boundary_is_unambiguous() {
+        assert_ne!(
+            content_fingerprint("n", "w", "u", "p\u{1f}q", "r", "c", false),
+            content_fingerprint("n", "w", "u", "p", "q\u{1f}r", "c", false),
+        );
+    }
 }

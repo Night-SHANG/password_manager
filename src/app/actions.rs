@@ -361,6 +361,7 @@ impl App {
         state.legacy_password.zeroize();
         state.legacy_password.clear();
         state.resolutions.clear();
+        state.apply_updates = true;
         match result {
             Ok(preview) => {
                 state.preview = Some(preview);
@@ -373,7 +374,7 @@ impl App {
         }
     }
 
-    pub(super) fn apply_import(&mut self) {
+    pub(super) fn apply_import(&mut self, preview_id: Uuid) {
         let Some(session) = &mut self.session else {
             return;
         };
@@ -383,9 +384,12 @@ impl App {
         let Some(preview) = &state.preview else {
             return;
         };
-        if preview.rows.iter().enumerate().any(|(i, row)| {
+        if preview.id() != preview_id {
+            return;
+        }
+        if preview.rows().iter().enumerate().any(|(i, row)| {
             matches!(
-                &row.class,
+                row.class(),
                 ImportClass::Conflict { .. } | ImportClass::LocallyDeleted { .. }
             ) && !state.resolutions.contains_key(&i)
         }) {
@@ -393,6 +397,7 @@ impl App {
             return;
         }
         let options = ImportApplyOptions {
+            preview_id,
             apply_update_candidates: state.apply_updates,
             conflict_resolutions: state.resolutions.clone(),
         };

@@ -25,7 +25,15 @@ fn legacy_encrypt(cipher: &Fernet, plaintext: &str) -> String {
 }
 
 fn create_legacy_db(path: &std::path::Path, master_password: &str, stored_password: &str) {
-    let salt = [9u8; 16];
+    create_legacy_db_with_salt(path, master_password, stored_password, [9; 16]);
+}
+
+fn create_legacy_db_with_salt(
+    path: &std::path::Path,
+    master_password: &str,
+    stored_password: &str,
+    salt: [u8; 16],
+) {
     let cipher = legacy_cipher(master_password, &salt);
 
     let conn = Connection::open(path).unwrap();
@@ -114,7 +122,9 @@ fn synthetic_legacy_sqlite_is_read_and_decrypted() {
     assert_eq!(batch.items[0].password, "synthetic-db-password");
     assert_eq!(batch.items[0].notes, "synthetic note");
     assert!(batch.items[0].favorite);
-    assert_eq!(batch.items[0].source_stable_id.as_deref(), Some("entry:1"));
+    let id = batch.items[0].source_stable_id.as_deref().unwrap();
+    assert!(id.starts_with("db:") && id.ends_with(":entry:1"));
+    assert_eq!(id.len(), 3 + 64 + 8);
     assert!(stage_passwords_db(&path, "wrong-master").is_err());
 }
 
@@ -132,7 +142,7 @@ fn legacy_db_stable_id_supports_true_incremental_update() {
         &first,
         &ImportApplyOptions {
             apply_update_candidates: true,
-            ..ImportApplyOptions::default()
+            ..ImportApplyOptions::for_preview(&first)
         },
     )
     .unwrap();
@@ -149,7 +159,7 @@ fn legacy_db_stable_id_supports_true_incremental_update() {
 
     let second = build_preview(&vault, stage_passwords_db(&old_db, "old-master").unwrap()).unwrap();
     assert!(matches!(
-        &second.rows[0].class,
+        &second.rows()[0].class(),
         ImportClass::UpdateCandidate { .. }
     ));
 
@@ -158,11 +168,40 @@ fn legacy_db_stable_id_supports_true_incremental_update() {
         &second,
         &ImportApplyOptions {
             apply_update_candidates: true,
-            ..ImportApplyOptions::default()
+            ..ImportApplyOptions::for_preview(&second)
         },
     )
     .unwrap();
 
     let id = vault.active_entries().next().unwrap().id;
     assert_eq!(vault.reveal_secret(id).unwrap().password, "source-v2");
+}
+
+#[test]
+fn independent_db_salts_do_not_alias_and_copies_keep_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("first.db");
+    let second = dir.path().join("second.db");
+    let copied = dir.path().join("renamed.db");
+    create_legacy_db_with_salt(&first, "old-master", "first", [1; 16]);
+    create_legacy_db_with_salt(&second, "old-master", "second", [2; 16]);
+    std::fs::copy(&first, &copied).unwrap();
+    let a = stage_passwords_db(&first, "old-master").unwrap();
+    let b = stage_passwords_db(&second, "old-master").unwrap();
+    let c = stage_passwords_db(&copied, "old-master").unwrap();
+    assert_ne!(a.items[0].source_stable_id, b.items[0].source_stable_id);
+    assert_eq!(a.items[0].source_stable_id, c.items[0].source_stable_id);
+    let mut vault = VaultSession::create(dir.path().join("new.pmvault"), "new-master").unwrap();
+    let preview = build_preview(&vault, a).unwrap();
+    apply_preview(
+        &mut vault,
+        &preview,
+        &ImportApplyOptions::for_preview(&preview),
+    )
+    .unwrap();
+    let next = build_preview(&vault, b).unwrap();
+    assert!(matches!(
+        next.rows()[0].class(),
+        ImportClass::Conflict { .. }
+    ));
 }

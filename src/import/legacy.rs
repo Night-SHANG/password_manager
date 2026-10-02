@@ -9,6 +9,7 @@ use fernet::Fernet;
 use pbkdf2::pbkdf2_hmac_array;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use sha2_legacy::Sha256 as LegacySha256;
 use zeroize::Zeroize;
 
@@ -159,6 +160,16 @@ pub fn stage_passwords_db(path: &Path, master_password: &str) -> Result<ImportBa
     }
     verification.zeroize();
 
+    // Scope row IDs to the authenticated database salt, not its path or name.
+    let mut namespace_hash = Sha256::new();
+    namespace_hash.update(b"password-manager:legacy-db-identity:v1\0");
+    namespace_hash.update(STANDARD.decode(salt.as_bytes())?);
+    let namespace = namespace_hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
     let mut statement = conn
         .prepare(
             "SELECT id, name, website, username, password, category, notes, is_favorite
@@ -227,7 +238,7 @@ pub fn stage_passwords_db(path: &Path, master_password: &str) -> Result<ImportBa
 
         items.push(NormalizedImportItem {
             provider: provider.clone(),
-            source_stable_id: Some(format!("entry:{}", row.id)),
+            source_stable_id: Some(format!("db:{namespace}:entry:{}", row.id)),
             name,
             website: row.website,
             username: row.username,

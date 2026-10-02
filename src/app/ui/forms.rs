@@ -136,11 +136,13 @@ impl App {
         .spacing(14);
         if let Some(preview) = &state.preview {
             let summary = preview.summary();
+            let preview_id = preview.id();
             form = form
                 .push(text(format!(
-                    "新增 {} · 重复 {} · 更新 {} · 冲突 {} · 本地已删除 {} · 无效 {}",
+                    "新增 {} · 已有重复 {} · 源内重复 {} · 更新 {} · 冲突 {} · 本地已删除 {} · 无效 {}",
                     summary.new,
                     summary.exact_duplicates,
+                    summary.source_duplicates,
                     summary.update_candidates,
                     summary.conflicts,
                     summary.locally_deleted,
@@ -149,11 +151,15 @@ impl App {
                 .push(
                     checkbox(state.apply_updates)
                         .label("应用更新候选（未本地修改的已导入条目）")
-                        .on_toggle(Message::ImportApplyUpdatesChanged),
+                        .on_toggle(move |value| Message::ImportApplyUpdatesChanged(preview_id, value)),
                 );
+            if summary.conflicts > 0 || summary.locally_deleted > 0 {
+                form = form
+                    .push(text("跳过只忽略当前来源行；其他行仍可能更新同一本地条目。").size(12));
+            }
             let mut unresolved = 0;
-            for (index, row) in preview.rows.iter().enumerate() {
-                match &row.class {
+            for (index, row) in preview.rows().iter().enumerate() {
+                match row.class() {
                     ImportClass::Conflict { existing_ids }
                     | ImportClass::LocallyDeleted { existing_ids } => {
                         let choice = state.resolutions.get(&index);
@@ -163,31 +169,33 @@ impl App {
                         let mut decision = column![
                             text(format!(
                                 "{}：{} · {}",
-                                if matches!(&row.class, ImportClass::LocallyDeleted { .. }) {
+                                if matches!(row.class(), ImportClass::LocallyDeleted { .. }) {
                                     "本地已删除"
                                 } else {
                                     "冲突"
                                 },
-                                row.item.name,
-                                row.item.username
+                                row.item().name,
+                                row.item().username
                             )),
                             row![
                                 button(if matches!(choice, Some(ConflictResolution::KeepLocal)) {
-                                    "已选：保留本地"
+                                    "已选：跳过此行"
                                 } else {
-                                    "保留本地"
+                                    "跳过此行"
                                 })
                                 .on_press(Message::SetImportResolution(
+                                    preview_id,
                                     index,
                                     ConflictResolution::KeepLocal
                                 ))
                                 .style(button::secondary),
                                 button(if matches!(choice, Some(ConflictResolution::KeepBoth)) {
-                                    "已选：两份都保留"
+                                    "已选：导入为独立条目"
                                 } else {
-                                    "两份都保留"
+                                    "导入为独立条目"
                                 })
                                 .on_press(Message::SetImportResolution(
+                                    preview_id,
                                     index,
                                     ConflictResolution::KeepBoth
                                 ))
@@ -197,7 +205,10 @@ impl App {
                         ]
                         .spacing(8);
                         for id in existing_ids {
-                            if let Some(entry) = session.entry(*id) {
+                            if let Some(entry) = session.entry(*id)
+                                && preview
+                                    .allows_resolution(index, &ConflictResolution::UseImported(*id))
+                            {
                                 let selected = matches!(choice, Some(ConflictResolution::UseImported(selected)) if selected == id);
                                 decision = decision.push(
                                     button(text(format!(
@@ -206,6 +217,7 @@ impl App {
                                         entry.name
                                     )))
                                     .on_press(Message::SetImportResolution(
+                                        preview_id,
                                         index,
                                         ConflictResolution::UseImported(*id),
                                     ))
@@ -216,7 +228,7 @@ impl App {
                         form = form.push(card(decision));
                     }
                     ImportClass::UpdateCandidate { .. } => {
-                        form = form.push(text(format!("更新候选：{}", row.item.name)).size(13))
+                        form = form.push(text(format!("更新候选：{}", row.item().name)).size(13))
                     }
                     _ => {}
                 }
@@ -225,7 +237,7 @@ impl App {
                 button("执行导入")
                     .on_press_maybe(
                         (unresolved == 0 && self.picker_pending.is_none())
-                            .then_some(Message::ApplyImport),
+                            .then_some(Message::ApplyImport(preview_id)),
                     )
                     .padding(10),
             );
