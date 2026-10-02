@@ -163,3 +163,27 @@ An earlier worker aggregate run lost an integration-test executable during
 concurrent rebuilds. That interrupted run was not treated as a pass; the final
 aggregate above was rerun serially after source edits stopped. Captures are
 synthetic review evidence, not automatically approved golden baselines.
+
+## Windows missing-settings warning regression (2026-10-02)
+
+CI32 exposed an overly broad `NotFound` fallback: Rust maps Windows
+`ERROR_PATH_NOT_FOUND` to this kind, including paths obstructed by a regular file.
+The reader now checks the nearest existing entry with `symlink_metadata` before
+accepting missing settings. Obstructions, dangling links and metadata errors keep
+the non-sensitive warning; genuinely missing paths, including through valid
+directory links, still use defaults without creating files. Existing assertions
+remain intact, with nested-parent and Unix link regressions added.
+Two dangling-link regressions failed before the change; all 15 focused preference
+tests, the library/test check and source formatting passed afterward on Linux.
+Windows execution and aggregate validation remain separate acceptance gates.
+Reference: https://github.com/rust-lang/rust/blob/1.90.0/library/std/src/sys/pal/windows/mod.rs
+
+The final Linux aggregate passed 145 Rust tests, strict Clippy, formatting,
+all-target check, debug build and binary self-test. A fresh GUI artifact run
+passed all 20 tests. The first GUI rerun retained older generated captures and
+reported one picker image mismatch; both sets were preserved and actual pixels
+were inspected. Differences were confined to the synthetic temporary backup path
+and timestamp. These are per-run review captures, not accepted golden baselines.
+Python CI checks again passed 12 tests with 8 PowerShell-only skips; source-data
+and sensitive-log guards passed. The lock hash is unchanged. Windows execution
+of the original regression remains a required CI gate.

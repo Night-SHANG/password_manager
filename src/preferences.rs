@@ -62,7 +62,9 @@ pub fn load(path: &Path) -> (Preferences, Option<String>) {
 fn read_settings(path: &Path) -> Result<Option<Preferences>, &'static str> {
     let file = match File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == ErrorKind::NotFound && settings_path_is_missing(path) => {
+            return Ok(None);
+        }
         Err(_) => return Err("无法读取设置文件，请检查文件权限"),
     };
     let metadata = file.metadata().map_err(|_| "无法读取设置文件信息")?;
@@ -93,6 +95,30 @@ fn read_settings(path: &Path) -> Result<Option<Preferences>, &'static str> {
     };
     validate(&preferences)?;
     Ok(Some(preferences))
+}
+
+fn settings_path_is_missing(path: &Path) -> bool {
+    // Windows can report NotFound for a child of a regular file as well as a
+    // missing path. Inspect the nearest existing entry without hiding dangling
+    // symlinks or metadata errors, and require a usable parent directory.
+    for (depth, candidate) in path.ancestors().enumerate() {
+        let candidate = if candidate.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            candidate
+        };
+        match fs::symlink_metadata(candidate) {
+            Ok(metadata) => {
+                return depth > 0
+                    && (metadata.is_dir()
+                        || (metadata.is_symlink()
+                            && fs::metadata(candidate).is_ok_and(|target| target.is_dir())));
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// Commit valid preferences atomically. Callers should apply them only on success.
@@ -175,9 +201,15 @@ mod tests {
     #[test]
     fn missing_file_uses_defaults_without_warning_or_writing() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("missing/settings.json");
-        assert_eq!(load(&path), (Preferences::default(), None));
-        assert!(!path.parent().unwrap().exists());
+        for relative in [
+            "settings.json",
+            "missing/settings.json",
+            "missing/nested/settings.json",
+        ] {
+            let path = directory.path().join(relative);
+            assert_eq!(load(&path), (Preferences::default(), None));
+        }
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -312,6 +344,62 @@ mod tests {
         let blocker = directory.path().join("blocker");
         fs::write(&blocker, "synthetic-secret").unwrap();
         assert_safe_fallback(&blocker.join("settings.json"));
+        assert_safe_fallback(&blocker.join("missing/nested/settings.json"));
+        assert_eq!(fs::read_to_string(&blocker).unwrap(), "synthetic-secret");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_settings_symlink_uses_defaults_and_a_visible_warning() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("missing.json");
+        let path = directory.path().join("settings.json");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert_safe_fallback(&path);
+        assert_eq!(fs::read_link(&path).unwrap(), target);
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_parent_symlink_uses_defaults_and_a_visible_warning() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("missing");
+        let link = directory.path().join("config");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_safe_fallback(&link.join("nested/settings.json"));
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_symlink_ancestor_uses_defaults_and_a_visible_warning() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("blocker");
+        fs::write(&target, "synthetic-secret").unwrap();
+        let link = directory.path().join("linked-file");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_safe_fallback(&link.join("missing/nested/settings.json"));
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "synthetic-secret");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_settings_under_directory_symlink_do_not_warn_or_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config");
+        fs::create_dir(&target).unwrap();
+        let link = directory.path().join("linked-config");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(
+            load(&link.join("missing/nested/settings.json")),
+            (Preferences::default(), None)
+        );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
     }
 
     #[test]
