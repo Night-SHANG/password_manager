@@ -7,6 +7,7 @@ use iced::{Alignment, Color};
 use super::*;
 
 mod forms;
+mod secret_input;
 
 #[cfg(test)]
 mod long_text_tests;
@@ -170,6 +171,24 @@ fn metadata_details(entry: &EntryRecord) -> Element<'_, Message> {
 }
 
 impl App {
+    fn clipboard_warning(&self) -> Element<'_, Message> {
+        if !self.clipboard_cleanup_failed {
+            return Space::new().height(0).into();
+        }
+        column![
+            text("剪贴板清理未确认，请手动覆盖剪贴板。此提示不会因锁定而消失。")
+                .size(12)
+                .wrapping(text::Wrapping::WordOrGlyph),
+            button("我已手动处理剪贴板")
+                .on_press(Message::AcknowledgeClipboardCleanup(
+                    self.clipboard_warning_generation
+                ))
+                .style(button::secondary),
+        ]
+        .spacing(4)
+        .into()
+    }
+
     fn path_field<'a>(
         &'a self,
         label: &'a str,
@@ -231,6 +250,9 @@ impl App {
                     .padding(24)
                     .width(Length::Fill)
                     .height(Length::Fill),
+                container(self.clipboard_warning())
+                    .padding([0, 24])
+                    .width(Length::Fill),
                 container(text(&self.status).size(12))
                     .padding([8, 24])
                     .width(Length::Fill),
@@ -303,6 +325,9 @@ impl App {
                 .size(16),
         ]
         .spacing(if self.creating { 10 } else { 16 });
+        if self.clipboard_cleanup_failed {
+            form = form.push(self.clipboard_warning());
+        }
         if self.creating {
             form = form.push(secret_field(
                 "确认主密码",
@@ -330,7 +355,11 @@ impl App {
                 } else {
                     "解 锁"
                 }))
-                .on_press_maybe(self.picker_pending.is_none().then_some(submit))
+                .on_press_maybe(
+                    (self.picker_pending.is_none()
+                        && (!cfg!(windows) || self.security_monitor_ready))
+                        .then_some(submit),
+                )
                 .padding(14)
                 .width(Length::Fill),
             )
@@ -354,6 +383,16 @@ impl App {
                 })
                 .on_press(Message::ToggleAuthOptions)
                 .style(button::text),
+            );
+        }
+        if cfg!(windows) && !self.security_monitor_ready {
+            form = form.push(
+                text(if self.security_monitor_failed {
+                    "系统监控初始化失败或已中断，请重启软件重试。"
+                } else {
+                    "正在等待系统监控就绪…"
+                })
+                .size(12),
             );
         }
         form = form.push(text("本地加密 · 测试版本，请勿作为唯一密码副本").size(11));

@@ -1,9 +1,11 @@
 #![allow(unsafe_code)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::path::Path;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use iced::futures::StreamExt;
 use iced::futures::channel::mpsc::{self, UnboundedSender};
@@ -14,42 +16,50 @@ use windows::Win32::Storage::FileSystem::{
     MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH,
     ReplaceFileW,
 };
-use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardSequenceNumber, OpenClipboard,
-};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::RemoteDesktop::{
     NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, PBT_APMSUSPEND,
-    PostMessageW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowDisplayAffinity,
-    TranslateMessage, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WINDOW_EX_STYLE, WM_APP, WM_DESTROY,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PBT_APMSUSPEND,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetWindowDisplayAffinity, TranslateMessage,
+    UnregisterClassW, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WINDOW_EX_STYLE, WM_APP, WM_DESTROY,
     WM_POWERBROADCAST, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_OVERLAPPED, WTS_SESSION_LOCK,
     WTS_SESSION_LOGOFF,
 };
 use windows::core::{PCWSTR, w};
 
-use super::{SecurityEvent, should_clear_clipboard};
+use super::clipboard::{ClipboardCommand, ClipboardEngine, ClipboardQueue, CopyCommand};
+use super::security_monitor::{MAX_STARTUP_ATTEMPTS, claim_monitor, retry_startup};
+use super::windows_clipboard::{CLIPBOARD_TIMER_ID, WindowsClipboard};
+use super::{ClipboardKind, ClipboardSession, SecurityEvent};
 use crate::{AppError, Result};
 
-const CLIPBOARD_ARM_MESSAGE: u32 = WM_APP + 0x31;
-const CLIPBOARD_CLEAR_NOW_MESSAGE: u32 = WM_APP + 0x32;
-const CLIPBOARD_TIMER_ID: usize = 0x504D_434C;
-const CLIPBOARD_RETRY_DELAY_MS: u32 = 250;
-const CLIPBOARD_MAX_RETRIES: u8 = 4;
+const CLIPBOARD_WAKE_MESSAGE: u32 = WM_APP + 0x31;
+const SHUTDOWN_WAIT_MS: u64 = 300;
 
+static MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
 static SECURITY_WINDOW: AtomicIsize = AtomicIsize::new(0);
+static CLIPBOARD_QUEUE: OnceLock<Mutex<ClipboardQueue>> = OnceLock::new();
 
 thread_local! {
+    static STOPPING_WINDOW: Cell<bool> = const {Cell::new(false)};
+    static FAILURE_SENT: Cell<bool> = const {Cell::new(false)};
     static EVENT_SENDER: RefCell<Option<UnboundedSender<SecurityEvent>>> = const { RefCell::new(None) };
-    static PENDING_CLIPBOARD: RefCell<Option<PendingClipboard>> = const { RefCell::new(None) };
+    static CLIPBOARD_ENGINE: RefCell<Option<ClipboardEngine<WindowsClipboard>>> = const { RefCell::new(None) };
+    static CURRENT_WRITER: RefCell<Option<ClipboardSession>> = const { RefCell::new(None) };
+    static DEFERRED_SECURITY_EVENTS: RefCell<Vec<SecurityEvent>> = const { RefCell::new(Vec::new()) };
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PendingClipboard {
-    sequence: u32,
-    retries: u8,
+fn clipboard_queue() -> std::sync::MutexGuard<'static, ClipboardQueue> {
+    CLIPBOARD_QUEUE
+        .get_or_init(|| Mutex::new(ClipboardQueue::default()))
+        .lock()
+        .unwrap_or_else(|error| {
+            let mut queue = error.into_inner();
+            queue.revoke_active();
+            queue
+        })
 }
 
 fn to_wide(path: &Path) -> Vec<u16> {
@@ -105,10 +115,6 @@ pub fn atomic_replace(target: &Path, replacement: &Path, backup: Option<&Path>) 
     Ok(())
 }
 
-pub fn clipboard_sequence_number() -> u32 {
-    unsafe { GetClipboardSequenceNumber() }
-}
-
 pub fn set_screen_capture_protection(hwnd_value: isize, enabled: bool) -> Result<()> {
     let hwnd = HWND(hwnd_value as *mut c_void);
     let affinity = if enabled {
@@ -129,22 +135,52 @@ pub fn security_events() -> Subscription<SecurityEvent> {
 
 fn security_event_stream() -> impl iced::futures::Stream<Item = SecurityEvent> {
     stream::channel(32, async |mut output| {
+        // A failed runtime owner requires a fresh process. A second subscription
+        // must not create another monitor while a previous owner is still alive.
+        if !claim_monitor(&MONITOR_STARTED) {
+            let _ = output.send(SecurityEvent::MonitorFailed).await;
+            return;
+        }
         let (sender, mut receiver) = mpsc::unbounded();
         let thread_sender = sender.clone();
 
         let spawn_result = std::thread::Builder::new()
             .name("password-manager-win-events".to_string())
             .spawn(move || {
-                if run_security_window(thread_sender.clone()).is_err() {
-                    let _ = thread_sender.unbounded_send(SecurityEvent::MonitorFailed);
+                for attempt in 1..=MAX_STARTUP_ATTEMPTS {
+                    let mut reached_ready = false;
+                    let mut cleanup_complete = true;
+                    FAILURE_SENT.with(|slot| slot.set(false));
+                    let _ = run_security_window(
+                        thread_sender.clone(),
+                        &mut reached_ready,
+                        &mut cleanup_complete,
+                    );
+                    SECURITY_WINDOW.store(0, Ordering::Release);
+                    clipboard_queue().revoke_active_native();
+                    if retry_startup(
+                        attempt,
+                        reached_ready,
+                        cleanup_complete,
+                        !thread_sender.is_closed(),
+                    ) {
+                        std::thread::sleep(Duration::from_millis(u64::from(attempt) * 250));
+                        continue;
+                    }
+                    if !FAILURE_SENT.with(Cell::get) {
+                        let _ = thread_sender.unbounded_send(SecurityEvent::MonitorFailed);
+                    }
+                    break;
                 }
             });
 
         if spawn_result.is_err() {
+            MONITOR_STARTED.store(false, Ordering::Release);
             let _ = output.send(SecurityEvent::MonitorFailed).await;
             return;
         }
 
+        drop(sender);
         while let Some(event) = receiver.next().await {
             if output.send(event).await.is_err() {
                 break;
@@ -153,36 +189,97 @@ fn security_event_stream() -> impl iced::futures::Stream<Item = SecurityEvent> {
     })
 }
 
-pub fn arm_clipboard_clear(expected_sequence: u32, timeout_ms: u32) -> Result<()> {
-    if expected_sequence == 0 {
-        return Err(AppError::Platform(
-            "clipboard sequence number is unavailable".to_string(),
-        ));
-    }
+pub fn begin_clipboard_session() -> ClipboardSession {
+    clipboard_queue().begin()
+}
 
+pub fn enqueue_copy(
+    session: &ClipboardSession,
+    request: u64,
+    kind: ClipboardKind,
+    text: zeroize::Zeroizing<String>,
+    timeout_ms: u32,
+) -> Result<()> {
     let hwnd = security_window()?;
-    unsafe {
-        PostMessageW(
-            Some(hwnd),
-            CLIPBOARD_ARM_MESSAGE,
-            WPARAM(expected_sequence as usize),
-            LPARAM(timeout_ms.max(1) as isize),
-        )
-        .map_err(|error| platform_error("PostMessageW(clipboard arm)", error))
+    let command = CopyCommand {
+        session: session.clone(),
+        request,
+        kind,
+        text,
+        timeout_ms,
+    };
+    clipboard_queue()
+        .push_copy(command, || post_clipboard_wake(hwnd))
+        .map_err(|()| {
+            AppError::Platform(
+                "clipboard request was revoked, superseded, or could not be queued".to_string(),
+            )
+        })
+}
+
+pub fn queue_revoked_cleanup() -> Result<()> {
+    let hwnd = security_window()?;
+    clipboard_queue()
+        .push_clear(|| post_clipboard_wake(hwnd))
+        .map_err(|()| AppError::Platform("clipboard cleanup could not be queued".to_string()))
+}
+
+pub fn shutdown_clipboard() -> Result<()> {
+    shutdown_barrier(None)
+}
+
+pub fn shutdown_clipboard_session(session: &ClipboardSession) -> Result<()> {
+    shutdown_barrier(Some(session.id()))
+}
+
+fn shutdown_barrier(session: Option<u64>) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_millis(SHUTDOWN_WAIT_MS);
+    let mutex = CLIPBOARD_QUEUE.get_or_init(|| Mutex::new(ClipboardQueue::default()));
+    let mut queue = loop {
+        match mutex.try_lock() {
+            Ok(queue) => break queue,
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                let mut queue = error.into_inner();
+                queue.revoke_active_native();
+                break queue;
+            }
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1))
+            }
+            Err(_) => {
+                return Err(AppError::Platform(
+                    "clipboard shutdown queue remained busy".to_string(),
+                ));
+            }
+        }
+    };
+    if session.is_none() {
+        queue.revoke_active_native();
+    }
+    let hwnd = security_window()?;
+    let (done, receiver) = std::sync::mpsc::sync_channel(1);
+    let queued = match session {
+        Some(session) => queue.push_shutdown(session, done, || post_clipboard_wake(hwnd)),
+        None => queue.push_stop(done, || post_clipboard_wake(hwnd)),
+    };
+    drop(queue);
+    queued.map_err(|()| {
+        AppError::Platform("clipboard shutdown cleanup could not be queued".to_string())
+    })?;
+    // One total bound covers acquiring the command queue and waiting for the
+    // native owner. Shutdown never waits on the native write gate itself.
+    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(true) => Ok(()),
+        _ => Err(AppError::Platform(
+            "clipboard shutdown cleanup did not complete".to_string(),
+        )),
     }
 }
 
-pub fn clear_armed_clipboard_now() -> Result<()> {
-    let hwnd = security_window()?;
-    unsafe {
-        PostMessageW(
-            Some(hwnd),
-            CLIPBOARD_CLEAR_NOW_MESSAGE,
-            WPARAM(0),
-            LPARAM(0),
-        )
-        .map_err(|error| platform_error("PostMessageW(clipboard clear)", error))
-    }
+fn post_clipboard_wake(hwnd: HWND) -> bool {
+    // WM_APP carries no pointer or secret. The typed queue owns and zeroizes
+    // payloads and withdraws a failed post while still holding its own mutex.
+    unsafe { PostMessageW(Some(hwnd), CLIPBOARD_WAKE_MESSAGE, WPARAM(0), LPARAM(0)).is_ok() }
 }
 
 fn security_window() -> Result<HWND> {
@@ -195,7 +292,11 @@ fn security_window() -> Result<HWND> {
     Ok(HWND(raw as *mut c_void))
 }
 
-fn run_security_window(sender: UnboundedSender<SecurityEvent>) -> Result<()> {
+fn run_security_window(
+    sender: UnboundedSender<SecurityEvent>,
+    reached_ready: &mut bool,
+    cleanup_complete: &mut bool,
+) -> Result<()> {
     EVENT_SENDER.with(|slot| {
         *slot.borrow_mut() = Some(sender);
     });
@@ -220,6 +321,19 @@ fn run_security_window(sender: UnboundedSender<SecurityEvent>) -> Result<()> {
         ));
     }
 
+    *cleanup_complete = false;
+    let result = run_registered_security_window(HINSTANCE(module.0), class_name, reached_ready);
+    let unregistered = unsafe { UnregisterClassW(class_name, Some(HINSTANCE(module.0))) }
+        .map_err(|error| platform_error("UnregisterClassW", error));
+    *cleanup_complete = unregistered.is_ok();
+    result.and(unregistered)
+}
+
+fn run_registered_security_window(
+    instance: HINSTANCE,
+    class_name: PCWSTR,
+    reached_ready: &mut bool,
+) -> Result<()> {
     let hwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -232,17 +346,29 @@ fn run_security_window(sender: UnboundedSender<SecurityEvent>) -> Result<()> {
             0,
             None,
             None,
-            Some(HINSTANCE(module.0)),
+            Some(instance),
             None,
         )
         .map_err(|error| platform_error("CreateWindowExW", error))?
     };
 
-    unsafe {
-        WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)
-            .map_err(|error| platform_error("WTSRegisterSessionNotification", error))?;
+    if let Err(error) = unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } {
+        destroy_security_window(hwnd);
+        return Err(platform_error("WTSRegisterSessionNotification", error));
     }
+    let backend = match WindowsClipboard::new(hwnd) {
+        Ok(backend) => backend,
+        Err(error) => {
+            unsafe {
+                let _ = WTSUnRegisterSessionNotification(hwnd);
+                destroy_security_window(hwnd);
+            }
+            return Err(error);
+        }
+    };
+    CLIPBOARD_ENGINE.with(|slot| *slot.borrow_mut() = Some(ClipboardEngine::new(backend)));
 
+    *reached_ready = true;
     SECURITY_WINDOW.store(hwnd.0 as isize, Ordering::Release);
     send_event(SecurityEvent::MonitorReady);
 
@@ -250,11 +376,9 @@ fn run_security_window(sender: UnboundedSender<SecurityEvent>) -> Result<()> {
     loop {
         let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
         if result.0 == -1 {
-            SECURITY_WINDOW.store(0, Ordering::Release);
-            return Err(platform_error(
-                "GetMessageW",
-                std::io::Error::last_os_error(),
-            ));
+            let error = platform_error("GetMessageW", std::io::Error::last_os_error());
+            stop_security_window(hwnd);
+            return Err(error);
         }
         if result.0 == 0 {
             break;
@@ -266,11 +390,134 @@ fn run_security_window(sender: UnboundedSender<SecurityEvent>) -> Result<()> {
         }
     }
 
+    stop_security_window(hwnd);
+    Ok(())
+}
+
+fn stop_security_window(hwnd: HWND) {
     SECURITY_WINDOW.store(0, Ordering::Release);
+    clipboard_queue().revoke_active();
+    with_engine(|engine| {
+        engine.stop();
+    });
+    let engine = CLIPBOARD_ENGINE.with(|slot| slot.borrow_mut().take());
+    drop(engine); // Native Drop calls must run after releasing the RefCell borrow.
     unsafe {
         let _ = WTSUnRegisterSessionNotification(hwnd);
+        destroy_security_window(hwnd);
     }
-    Ok(())
+}
+
+fn destroy_security_window(hwnd: HWND) {
+    STOPPING_WINDOW.with(|slot| slot.set(true));
+    let _ = unsafe { DestroyWindow(hwnd) };
+    STOPPING_WINDOW.with(|slot| slot.set(false));
+}
+
+fn with_engine(operation: impl FnOnce(&mut ClipboardEngine<WindowsClipboard>)) {
+    // Win32 clipboard calls may synchronously reenter this WndProc. Move the
+    // engine out instead of keeping a RefCell borrow alive across native calls.
+    let Some(mut engine) = CLIPBOARD_ENGINE.with(|slot| slot.borrow_mut().take()) else {
+        return;
+    };
+    operation(&mut engine);
+    let mut lifecycle = Vec::new();
+    loop {
+        let deferred =
+            DEFERRED_SECURITY_EVENTS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+        if deferred.is_empty() {
+            break;
+        }
+        clipboard_queue().revoke_active_native();
+        engine.clear_revoked();
+        for event in deferred {
+            if !lifecycle.contains(&event) {
+                lifecycle.push(event);
+            }
+        }
+    }
+    let events = engine.events();
+    let failed = events.contains(&SecurityEvent::MonitorFailed)
+        || lifecycle.contains(&SecurityEvent::MonitorFailed);
+    CLIPBOARD_ENGINE.with(|slot| *slot.borrow_mut() = Some(engine));
+    for event in events
+        .into_iter()
+        .chain(lifecycle)
+        .filter(|event| *event != SecurityEvent::MonitorFailed)
+    {
+        send_event(event);
+    }
+    if failed {
+        // Keep restart guidance last, after any copy/cleanup error statuses.
+        send_event(SecurityEvent::MonitorFailed);
+        SECURITY_WINDOW.store(0, Ordering::Release);
+        clipboard_queue().revoke_active_native();
+        unsafe { PostQuitMessage(1) };
+    }
+    let needs_wake = { clipboard_queue().has_work() };
+    if !failed
+        && needs_wake
+        && let Ok(hwnd) = security_window()
+    {
+        // A reentrant wake may have arrived while the owner was busy. Re-post
+        // after restoring it so no typed command loses its only wake-up.
+        if !post_clipboard_wake(hwnd) {
+            SECURITY_WINDOW.store(0, Ordering::Release);
+            clipboard_queue().revoke_active_native();
+            send_event(SecurityEvent::MonitorFailed);
+            unsafe { PostQuitMessage(1) };
+        }
+    }
+}
+
+fn process_clipboard_queue() {
+    if !CLIPBOARD_ENGINE.with(|slot| slot.borrow().is_some()) {
+        return;
+    }
+    loop {
+        let command = { clipboard_queue().pop() };
+        let Some(command) = command else {
+            break;
+        };
+        with_engine(|engine| match command {
+            ClipboardCommand::Copy(command) => {
+                CURRENT_WRITER.with(|slot| *slot.borrow_mut() = Some(command.session.clone()));
+                engine.write(command);
+                CURRENT_WRITER.with(|slot| {
+                    slot.borrow_mut().take();
+                });
+            }
+            ClipboardCommand::ClearRevoked => engine.clear_revoked(),
+            ClipboardCommand::Shutdown { session, done } => {
+                let _ = done.try_send(engine.shutdown(session));
+            }
+            ClipboardCommand::Stop { done } => {
+                let _ = done.try_send(engine.stop());
+            }
+        });
+        if SECURITY_WINDOW.load(Ordering::Acquire) == 0 {
+            break;
+        }
+    }
+}
+
+fn native_security_event(event: SecurityEvent) {
+    // A reentrant native event must never wait on the same write gate or on a
+    // queue mutex whose caller may be waiting for that gate. Atomically revoke
+    // the in-flight writer now; the owner revokes all queued permits and cleans
+    // its receipt before delivering the deferred App notification.
+    CURRENT_WRITER.with(|slot| {
+        if let Some(session) = slot.borrow().as_ref() {
+            session.revoke_native();
+        }
+    });
+    DEFERRED_SECURITY_EVENTS.with(|slot| {
+        let mut events = slot.borrow_mut();
+        if !events.contains(&event) {
+            events.push(event);
+        }
+    });
+    with_engine(|_| {});
 }
 
 unsafe extern "system" fn security_wndproc(
@@ -283,111 +530,56 @@ unsafe extern "system" fn security_wndproc(
         WM_WTSSESSION_CHANGE => {
             let reason = wparam.0 as u32;
             if reason == WTS_SESSION_LOCK {
-                clear_clipboard_if_unchanged(hwnd, true);
-                send_event(SecurityEvent::SessionLocked);
+                native_security_event(SecurityEvent::SessionLocked);
             } else if reason == WTS_SESSION_LOGOFF {
-                clear_clipboard_if_unchanged(hwnd, true);
-                send_event(SecurityEvent::SessionLoggedOff);
+                native_security_event(SecurityEvent::SessionLoggedOff);
             }
             return LRESULT(0);
         }
         WM_POWERBROADCAST if wparam.0 as u32 == PBT_APMSUSPEND => {
-            clear_clipboard_if_unchanged(hwnd, true);
-            send_event(SecurityEvent::SystemSuspending);
+            native_security_event(SecurityEvent::SystemSuspending);
             return LRESULT(1);
         }
-        CLIPBOARD_ARM_MESSAGE => {
-            let _ = unsafe { KillTimer(Some(hwnd), CLIPBOARD_TIMER_ID) };
-            PENDING_CLIPBOARD.with(|pending| {
-                *pending.borrow_mut() = Some(PendingClipboard {
-                    sequence: wparam.0 as u32,
-                    retries: 0,
-                });
-            });
-
-            let timer = unsafe {
-                SetTimer(
-                    Some(hwnd),
-                    CLIPBOARD_TIMER_ID,
-                    (lparam.0 as u32).max(1),
-                    None,
-                )
-            };
-            if timer == 0 {
-                PENDING_CLIPBOARD.with(|pending| {
-                    pending.borrow_mut().take();
-                });
-                send_event(SecurityEvent::ClipboardCleanupFailed);
-            }
-            return LRESULT(0);
-        }
-        CLIPBOARD_CLEAR_NOW_MESSAGE => {
-            clear_clipboard_if_unchanged(hwnd, true);
+        CLIPBOARD_WAKE_MESSAGE => {
+            process_clipboard_queue();
             return LRESULT(0);
         }
         WM_TIMER if wparam.0 == CLIPBOARD_TIMER_ID => {
-            clear_clipboard_if_unchanged(hwnd, false);
+            with_engine(|engine| engine.tick());
             return LRESULT(0);
         }
         WM_DESTROY => {
+            if STOPPING_WINDOW.with(Cell::get)
+                || SECURITY_WINDOW.load(Ordering::Acquire) != hwnd.0 as isize
+            {
+                return LRESULT(0);
+            }
             SECURITY_WINDOW.store(0, Ordering::Release);
+            native_security_event(SecurityEvent::MonitorFailed);
+            with_engine(|engine| {
+                engine.stop();
+            });
             unsafe { PostQuitMessage(0) };
             return LRESULT(0);
         }
         _ => {}
     }
-
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
-fn clear_clipboard_if_unchanged(hwnd: HWND, force_no_retry: bool) {
-    let _ = unsafe { KillTimer(Some(hwnd), CLIPBOARD_TIMER_ID) };
-
-    PENDING_CLIPBOARD.with(|pending_slot| {
-        let Some(mut pending) = pending_slot.borrow_mut().take() else {
-            return;
-        };
-
-        let current = unsafe { GetClipboardSequenceNumber() };
-        if !should_clear_clipboard(pending.sequence, current) {
-            return;
-        }
-
-        match unsafe { OpenClipboard(Some(hwnd)) } {
-            Ok(()) => {
-                let current_after_open = unsafe { GetClipboardSequenceNumber() };
-                if should_clear_clipboard(pending.sequence, current_after_open) {
-                    let _ = unsafe { EmptyClipboard() };
-                }
-                let _ = unsafe { CloseClipboard() };
-            }
-            Err(_) if !force_no_retry && pending.retries < CLIPBOARD_MAX_RETRIES => {
-                pending.retries += 1;
-                *pending_slot.borrow_mut() = Some(pending);
-                let timer = unsafe {
-                    SetTimer(
-                        Some(hwnd),
-                        CLIPBOARD_TIMER_ID,
-                        CLIPBOARD_RETRY_DELAY_MS,
-                        None,
-                    )
-                };
-                if timer == 0 {
-                    pending_slot.borrow_mut().take();
-                    send_event(SecurityEvent::ClipboardCleanupFailed);
-                }
-            }
-            Err(_) => {
-                send_event(SecurityEvent::ClipboardCleanupFailed);
-            }
-        }
-    });
-}
-
 fn send_event(event: SecurityEvent) {
-    EVENT_SENDER.with(|sender| {
-        if let Some(sender) = sender.borrow_mut().as_mut() {
-            let _ = sender.unbounded_send(event);
-        }
+    if event == SecurityEvent::MonitorFailed {
+        FAILURE_SENT.with(|slot| slot.set(true));
+    }
+    let sent = EVENT_SENDER.with(|sender| {
+        sender
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|sender| sender.unbounded_send(event).is_ok())
     });
+    if !sent {
+        SECURITY_WINDOW.store(0, Ordering::Release);
+        clipboard_queue().revoke_active_native();
+        unsafe { PostQuitMessage(1) };
+    }
 }

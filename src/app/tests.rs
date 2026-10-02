@@ -4,7 +4,7 @@ use iced_test::{Simulator, selector};
 
 const SIZES: [(f32, f32); 3] = [(960.0, 640.0), (1280.0, 800.0), (1600.0, 900.0)];
 
-fn fixture(count: usize) -> (tempfile::TempDir, App) {
+pub(super) fn fixture(count: usize) -> (tempfile::TempDir, App) {
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::initial();
     let path = dir.path().join("synthetic-gui.pmvault");
@@ -22,6 +22,7 @@ fn fixture(count: usize) -> (tempfile::TempDir, App) {
     vault.save().unwrap();
     app.vault_path = path.display().to_string();
     app.session = Some(vault);
+    app.reset_unlocked_state();
     (dir, app)
 }
 
@@ -687,4 +688,229 @@ fn gui_picker_path_fields_stay_clear_of_auth_scrollbar() {
             );
         }
     }
+}
+
+#[test]
+#[ignore = "headless GUI regression"]
+fn gui_safety_settings_are_visible_at_supported_sizes() {
+    let (dir, mut app) = fixture(0);
+    app.preferences_path = Some(dir.path().join("settings.json"));
+    let _ = app.update(Message::OpenSettings);
+    for size in SIZES {
+        let mut ui = simulator(&app, size);
+        for label in ["闲置自动锁定", "密码剪贴板清理"] {
+            let target = ui.find(label).expect("security setting missing");
+            assert!(target.visible_bounds().is_some());
+        }
+        drop(ui);
+        capture(&app, "safety-settings", size);
+        let mut ui = simulator(&app, size);
+        let bounds = ui
+            .click(selector::id("idle-timeout-setting"))
+            .unwrap()
+            .bounds();
+        ui.snapshot(&app.theme())
+            .unwrap()
+            .matches_image(format!(
+                "target/gui-artifacts/safety-timeout-menu-{}.png",
+                size.0 as u32
+            ))
+            .unwrap();
+        // Iced menu rows are painted as one widget, so text selectors cannot
+        // address individual options. Click the first visible row below the control.
+        let point = iced::Point::new(bounds.center_x(), bounds.y + bounds.height + 10.0);
+        ui.point_at(point);
+        ui.simulate([iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+            position: point,
+        })]);
+        ui.simulate(iced_test::simulator::click());
+        let messages: Vec<_> = ui.into_messages().collect();
+        assert!(matches!(
+            messages.first(),
+            Some(Message::IdleTimeoutChanged(1))
+        ));
+        apply_messages(&mut app, messages);
+        assert_eq!(app.idle_minutes, 1);
+        let _ = app.update(Message::IdleTimeoutChanged(5));
+        let mut ui = simulator(&app, size);
+        let bounds = ui
+            .click(selector::id("clipboard-timeout-setting"))
+            .unwrap()
+            .bounds();
+        let point = iced::Point::new(bounds.center_x(), bounds.y + bounds.height + 10.0);
+        ui.point_at(point);
+        ui.simulate([iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+            position: point,
+        })]);
+        ui.simulate(iced_test::simulator::click());
+        let messages: Vec<_> = ui.into_messages().collect();
+        assert!(matches!(
+            messages.first(),
+            Some(Message::ClipboardTimeoutChanged(15))
+        ));
+        apply_messages(&mut app, messages);
+        assert_eq!(app.clipboard_seconds, 15);
+        let _ = app.update(Message::ClipboardTimeoutChanged(30));
+    }
+}
+
+#[test]
+#[ignore = "headless GUI regression"]
+fn gui_editor_password_keyboard_copy_uses_managed_pipeline() {
+    let (_dir, mut app) = fixture(0);
+    let _ = app.update(Message::NewEntry);
+    let _ = app.update(Message::EditorPasswordChanged("synthetic-键盘🦀".into()));
+    let _ = app.update(Message::ToggleEditorPasswordVisible(app.context_generation));
+    for key in ["c", "x"] {
+        let mut ui = simulator(&app, SIZES[0]);
+        ui.click(selector::id("editor-password-input")).unwrap();
+        ui.simulate([iced::Event::Keyboard(keyboard::Event::ModifiersChanged(
+            keyboard::Modifiers::CTRL,
+        ))]);
+        ui.simulate(iced_test::simulator::tap_key(
+            keyboard::Key::Character("a".into()),
+            None,
+        ));
+        ui.simulate(iced_test::simulator::tap_key(
+            keyboard::Key::Character(key.into()),
+            None,
+        ));
+        let messages: Vec<_> = ui.into_messages().collect();
+        if key == "x" {
+            assert!(
+                !messages
+                    .iter()
+                    .any(|message| matches!(message, Message::EditorPasswordChanged(_))),
+                "cut removed the draft before native copy success"
+            );
+        }
+        assert!(messages.iter().any(|message| {
+            match message {
+                Message::CopyEditorPasswordSelection(_, _, cut) if key == "x" => {
+                    cut.as_ref().is_some_and(|cut| {
+                        cut.original.as_str() == "synthetic-键盘🦀" && cut.replacement.is_empty()
+                    })
+                }
+                Message::CopyEditorPasswordSelection(_, _, cut) => cut.is_none(),
+                _ => false,
+            }
+        }));
+
+        assert!(
+            messages.iter().any(|message| matches!(message,
+                Message::CopyEditorPasswordSelection(generation, value, _)
+                if *generation == app.context_generation && value.as_str() == "synthetic-键盘🦀"
+            )),
+            "password keyboard copy bypassed managed clipboard"
+        );
+    }
+}
+
+#[test]
+#[ignore = "headless GUI regression"]
+fn gui_cleanup_warning_remains_visible_after_lock() {
+    let (_dir, mut app) = fixture(0);
+    let _ = app.update(Message::PlatformSecurity(
+        SecurityEvent::ClipboardCleanupFailed,
+    ));
+    let _ = app.update(Message::PlatformSecurity(SecurityEvent::SystemSuspending));
+    capture(&app, "safety-cleanup-warning", SIZES[0]);
+    let mut ui = simulator(&app, SIZES[0]);
+    let acknowledgement = ui.find("我已手动处理剪贴板").unwrap();
+    assert!(acknowledgement.visible_bounds().is_some());
+    ui.click("我已手动处理剪贴板").unwrap();
+    let messages: Vec<_> = ui.into_messages().collect();
+    apply_messages(&mut app, messages);
+    assert!(!app.clipboard_cleanup_failed);
+}
+
+fn command_key(ui: &mut Simulator<'_, Message>, key: &str) {
+    ui.simulate([iced::Event::Keyboard(keyboard::Event::ModifiersChanged(
+        keyboard::Modifiers::CTRL,
+    ))]);
+    ui.simulate(iced_test::simulator::tap_key(
+        keyboard::Key::Character(key.into()),
+        None,
+    ));
+    ui.simulate([iced::Event::Keyboard(keyboard::Event::ModifiersChanged(
+        keyboard::Modifiers::empty(),
+    ))]);
+}
+
+#[test]
+#[ignore = "headless GUI regression"]
+fn gui_password_cut_batches_preserve_uncopied_draft() {
+    let (_dir, mut app) = fixture(0);
+    let _ = app.update(Message::NewEntry);
+    let _ = app.update(Message::EditorPasswordChanged("synthetic-original".into()));
+    let _ = app.update(Message::ToggleEditorPasswordVisible(app.context_generation));
+    for before_cut in [false, true] {
+        let mut ui = simulator(&app, SIZES[0]);
+        ui.click(selector::id("editor-password-input")).unwrap();
+        if before_cut {
+            ui.tap_key(keyboard::key::Named::End);
+            ui.typewrite("Z");
+        }
+        command_key(&mut ui, "a");
+        command_key(&mut ui, "x");
+        if !before_cut {
+            ui.typewrite("Z");
+        }
+        let messages: Vec<_> = ui.into_messages().collect();
+        if before_cut {
+            assert!(messages.iter().any(|message| matches!(message,
+                Message::CopyEditorPasswordSelection(_, _, Some(cut)) if cut.original.as_str() == "synthetic-originalZ"
+            )), "cut captured stale view-build text");
+        } else {
+            assert!(
+                messages.iter().any(|message| matches!(message,
+                    Message::EditorPasswordChanged(value) if value == "synthetic-originalZ"
+                )),
+                "batched typing after cut lost the unconfirmed original"
+            );
+        }
+    }
+    let mut ui = simulator(&app, SIZES[0]);
+    ui.click(selector::id("editor-password-input")).unwrap();
+    ui.tap_key(keyboard::key::Named::Home);
+    ui.tap_key(keyboard::key::Named::ArrowRight);
+    command_key(&mut ui, "x");
+    assert!(
+        !ui.into_messages().any(|message| matches!(
+            message,
+            Message::EditorPasswordChanged(_) | Message::CopyEditorPasswordSelection(..)
+        )),
+        "cut without selection changed a password"
+    );
+    let _ = app.update(Message::EditorPasswordChanged("ab👩‍💻e\u{301}cd".into()));
+    let mut ui = simulator(&app, SIZES[0]);
+    ui.click(selector::id("editor-password-input")).unwrap();
+    ui.tap_key(keyboard::key::Named::Home);
+    ui.tap_key(keyboard::key::Named::ArrowRight);
+    ui.simulate([iced::Event::Keyboard(keyboard::Event::ModifiersChanged(
+        keyboard::Modifiers::SHIFT,
+    ))]);
+    ui.tap_key(keyboard::key::Named::ArrowRight);
+    ui.tap_key(keyboard::key::Named::ArrowRight);
+    command_key(&mut ui, "x");
+    assert!(
+        ui.into_messages().any(|message| matches!(message,
+            Message::CopyEditorPasswordSelection(_, value, Some(cut))
+            if value.as_str() == "b👩‍💻" && cut.replacement.as_str() == "ae\u{301}cd"
+        )),
+        "cut did not respect emoji/combining grapheme boundaries"
+    );
+    let _ = app.update(Message::ToggleEditorPasswordVisible(app.context_generation));
+    let mut ui = simulator(&app, SIZES[0]);
+    ui.click(selector::id("editor-password-input")).unwrap();
+    command_key(&mut ui, "a");
+    command_key(&mut ui, "c");
+    command_key(&mut ui, "x");
+    assert!(
+        !ui.into_messages().any(|message| matches!(
+            message,
+            Message::CopyEditorPasswordSelection(..) | Message::EditorPasswordChanged(_)
+        )),
+        "masked input permitted copy or cut"
+    );
 }

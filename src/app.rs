@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iced::widget::{self, operation, text_editor};
-use iced::{Element, Font, Length, Subscription, Task, Theme, clipboard, keyboard};
+use iced::{Element, Font, Length, Subscription, Task, Theme, keyboard};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -21,11 +21,11 @@ use crate::{AppError, Result};
 
 mod actions;
 mod picker;
+mod safety;
 #[cfg(test)]
 mod tests;
 mod ui;
 
-const PASSWORD_CLIPBOARD_TIMEOUT_MS: u32 = 30_000;
 const UI_FONT: Font = Font::with_name("Microsoft YaHei UI");
 
 pub fn run() -> iced::Result {
@@ -47,6 +47,16 @@ pub fn run() -> iced::Result {
 }
 
 struct App {
+    pending_editor_cut: Option<PendingEditorCut>,
+    clipboard_cleanup_failed: bool,
+    clipboard_warning_generation: u64,
+    clipboard_session: Option<platform::ClipboardSession>,
+    clipboard_request: u64,
+    last_activity: std::time::Instant,
+    window_focused: bool,
+    idle_minutes: u16,
+    clipboard_seconds: u16,
+    preferences_path: Option<std::path::PathBuf>,
     picker_pending: Option<picker::Pending>,
     picker_sequence: u64,
     vault_path: String,
@@ -69,6 +79,7 @@ struct App {
     screen_capture_protection_requested: bool,
     screen_capture_protection_active: bool,
     security_monitor_ready: bool,
+    security_monitor_failed: bool,
     status: String,
 }
 
@@ -216,7 +227,25 @@ enum ContextActionKind {
 }
 
 #[derive(Clone)]
+struct EditorCut {
+    original: zeroize::Zeroizing<String>,
+    replacement: zeroize::Zeroizing<String>,
+}
+
+struct PendingEditorCut {
+    generation: u64,
+    request: u64,
+    change: EditorCut,
+}
+
+#[derive(Clone)]
 enum Message {
+    AcknowledgeClipboardCleanup(u64),
+    SecurityTick(std::time::Instant),
+    UserActivity(std::time::Instant),
+    WindowFocusChanged(bool),
+    IdleTimeoutChanged(u16),
+    ClipboardTimeoutChanged(u16),
     PickPath(picker::Purpose),
     PathPicked(u64, std::result::Result<Option<std::path::PathBuf>, String>),
     AuthMode(bool),
@@ -247,7 +276,8 @@ enum Message {
     EditorNotesAction(text_editor::Action),
     EditorCategoryChanged(String),
     EditorFavoriteChanged(bool),
-    ToggleEditorPasswordVisible,
+    ToggleEditorPasswordVisible(u64),
+    CopyEditorPasswordSelection(u64, zeroize::Zeroizing<String>, Option<EditorCut>),
     GeneratePassword,
     SaveEditor,
     CancelPanel,
@@ -286,7 +316,6 @@ enum Message {
     ScreenCaptureProtectionChanged(bool),
     ScreenCaptureProtectionApplied(std::result::Result<bool, String>),
     PlatformSecurity(SecurityEvent),
-    PasswordClipboardWritten,
 }
 
 impl std::fmt::Debug for Message {
@@ -302,6 +331,16 @@ impl std::fmt::Debug for Message {
 impl App {
     fn initial() -> Self {
         Self {
+            pending_editor_cut: None,
+            clipboard_cleanup_failed: false,
+            clipboard_warning_generation: 0,
+            clipboard_session: None,
+            clipboard_request: 0,
+            last_activity: std::time::Instant::now(),
+            window_focused: true,
+            idle_minutes: 5,
+            clipboard_seconds: 30,
+            preferences_path: None,
             picker_pending: None,
             picker_sequence: 0,
             vault_path: "passwords.pmvault".to_string(),
@@ -324,13 +363,25 @@ impl App {
             screen_capture_protection_requested: true,
             screen_capture_protection_active: false,
             security_monitor_ready: false,
+            security_monitor_failed: false,
             status: String::new(),
         }
     }
 
     fn new() -> (Self, Task<Message>) {
+        let mut app = Self::initial();
+        match crate::preferences::default_path() {
+            Ok(path) => {
+                let (preferences, warning) = crate::preferences::load(&path);
+                app.idle_minutes = preferences.auto_lock_minutes;
+                app.clipboard_seconds = preferences.clipboard_seconds;
+                app.preferences_path = Some(path);
+                app.status = warning.unwrap_or_default();
+            }
+            Err(warning) => app.status = warning,
+        }
         (
-            Self::initial(),
+            app,
             platform::set_screen_capture_protection(true)
                 .map(Message::ScreenCaptureProtectionApplied),
         )
@@ -383,11 +434,18 @@ impl App {
         });
         Subscription::batch([
             hotkeys,
+            iced::event::listen_with(safety::runtime_event),
+            if self.session.is_some() {
+                iced::time::every(std::time::Duration::from_secs(1)).map(Message::SecurityTick)
+            } else {
+                Subscription::none()
+            },
             platform::security_events().map(Message::PlatformSecurity),
         ])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        self.security_tick(std::time::Instant::now());
         if self.picker_pending.is_some()
             && matches!(
                 &message,
@@ -451,6 +509,23 @@ impl App {
             return Task::none();
         }
         match message {
+            Message::AcknowledgeClipboardCleanup(generation) => {
+                if generation == self.clipboard_warning_generation {
+                    self.clipboard_cleanup_failed = false;
+                    self.clipboard_warning_generation =
+                        self.clipboard_warning_generation.wrapping_add(1);
+                    self.status = "已确认手动处理剪贴板".into();
+                }
+            }
+            Message::SecurityTick(now) => self.security_tick(now),
+            Message::UserActivity(now) => self.user_activity(now),
+            Message::WindowFocusChanged(focused) => self.window_focus_changed(focused),
+            Message::IdleTimeoutChanged(minutes) => {
+                self.change_security_preferences(minutes, self.clipboard_seconds)
+            }
+            Message::ClipboardTimeoutChanged(seconds) => {
+                self.change_security_preferences(self.idle_minutes, seconds)
+            }
             Message::PickPath(purpose) => return self.begin_picker(purpose),
             Message::PathPicked(id, result) => self.finish_picker(id, result),
             Message::AuthMode(creating) => {
@@ -570,6 +645,7 @@ impl App {
                 }
             }
             Message::EditorPasswordChanged(value) => {
+                self.pending_editor_cut = None;
                 if let Panel::Editor(s) = &mut self.panel {
                     replace_secret(&mut s.password, value);
                 }
@@ -590,12 +666,43 @@ impl App {
                     s.favorite = value;
                 }
             }
-            Message::ToggleEditorPasswordVisible => {
+            Message::CopyEditorPasswordSelection(generation, value, cut) => {
+                if self.session.is_some()
+                    && generation == self.context_generation
+                    && matches!(self.panel, Panel::Editor(_))
+                {
+                    self.pending_editor_cut = None;
+                    self.clipboard_request = self.clipboard_request.wrapping_add(1);
+                    if let Some(permit) = &self.clipboard_session {
+                        match platform::enqueue_password_copy(
+                            permit,
+                            self.clipboard_request,
+                            value,
+                            u32::from(self.clipboard_seconds) * 1000,
+                        ) {
+                            Ok(()) => {
+                                self.pending_editor_cut = cut.map(|change| PendingEditorCut {
+                                    generation,
+                                    request: self.clipboard_request,
+                                    change,
+                                });
+                                self.status = "正在安全复制选中的密码内容…".into();
+                            }
+                            Err(error) => self.status = format!("安全复制失败：{error}"),
+                        }
+                    }
+                }
+            }
+            Message::ToggleEditorPasswordVisible(generation) => {
+                if !self.window_focused || generation != self.context_generation {
+                    return Task::none();
+                }
                 if let Panel::Editor(s) = &mut self.panel {
                     s.password_visible = !s.password_visible;
                 }
             }
             Message::GeneratePassword => {
+                self.pending_editor_cut = None;
                 if let Panel::Editor(s) = &mut self.panel {
                     match generate_password(PasswordGeneratorOptions::default()) {
                         Ok(value) => replace_secret(&mut s.password, value),
@@ -611,13 +718,22 @@ impl App {
             Message::ToggleReveal => self.toggle_reveal(),
             Message::CopyPassword => {
                 self.close_context();
-                if let Some(session) = &self.session
-                    && let Some(id) = self.selected
+                self.clipboard_request = self.clipboard_request.wrapping_add(1);
+                if let (Some(session), Some(permit), Some(id)) =
+                    (&self.session, &self.clipboard_session, self.selected)
                 {
                     match session.reveal_secret(id) {
                         Ok(secret) => {
-                            return clipboard::write::<Message>(secret.password.clone())
-                                .chain(Task::done(Message::PasswordClipboardWritten));
+                            let result = platform::enqueue_password_copy(
+                                permit,
+                                self.clipboard_request,
+                                zeroize::Zeroizing::new(secret.password.clone()),
+                                u32::from(self.clipboard_seconds) * 1000,
+                            );
+                            self.status = match result {
+                                Ok(()) => "正在安全复制密码…".into(),
+                                Err(error) => format!("安全复制失败：{error}"),
+                            };
                         }
                         Err(error) => self.status = format!("复制失败：{error}"),
                     }
@@ -625,8 +741,18 @@ impl App {
             }
             Message::CopyUsername => {
                 self.close_context();
-                if let Some(entry) = self.selected_entry() {
-                    return clipboard::write::<Message>(entry.username.clone()).discard();
+                self.clipboard_request = self.clipboard_request.wrapping_add(1);
+                if let (Some(entry), Some(permit)) =
+                    (self.selected_entry(), &self.clipboard_session)
+                {
+                    self.status = match platform::enqueue_username_copy(
+                        permit,
+                        self.clipboard_request,
+                        entry.username.clone(),
+                    ) {
+                        Ok(()) => "正在复制账号…".into(),
+                        Err(error) => format!("安全复制失败：{error}"),
+                    };
                 }
             }
             Message::OpenWebsite => self.open_selected_website(),
@@ -741,7 +867,49 @@ impl App {
                 }
             },
             Message::PlatformSecurity(event) => match event {
+                SecurityEvent::ClipboardCopyCompleted {
+                    session,
+                    request,
+                    kind,
+                    outcome,
+                } => {
+                    if self.session.is_some()
+                        && self
+                            .clipboard_session
+                            .as_ref()
+                            .is_some_and(|current| current.id() == session)
+                        && request == self.clipboard_request
+                    {
+                        if kind == platform::ClipboardKind::Password {
+                            self.finish_editor_cut(request, outcome);
+                        }
+                        if outcome == platform::ClipboardCopyOutcome::Copied {
+                            // A verified new write supersedes the previously unconfirmed contents.
+                            self.clipboard_cleanup_failed = false;
+                            self.clipboard_warning_generation =
+                                self.clipboard_warning_generation.wrapping_add(1);
+                        }
+                        self.status = match (kind, outcome) {
+                            (
+                                platform::ClipboardKind::Password,
+                                platform::ClipboardCopyOutcome::Copied,
+                            ) => "密码已复制，将仅在仍持有该次内容时按时清理".into(),
+                            (
+                                platform::ClipboardKind::Username,
+                                platform::ClipboardCopyOutcome::Copied,
+                            ) => "账号已复制".into(),
+                            (_, platform::ClipboardCopyOutcome::Cancelled) => "复制已取消".into(),
+                            (_, platform::ClipboardCopyOutcome::Failed) => {
+                                "复制失败；请重试，勿依赖当前剪贴板内容".into()
+                            }
+                        };
+                    }
+                }
                 SecurityEvent::MonitorReady => {
+                    if self.security_monitor_failed {
+                        self.status = "Windows 会话监控已恢复，请重新解锁".into();
+                    }
+                    self.security_monitor_failed = false;
                     self.security_monitor_ready = true;
                     if self.screen_capture_protection_requested
                         && !self.screen_capture_protection_active
@@ -752,7 +920,10 @@ impl App {
                 }
                 SecurityEvent::MonitorFailed => {
                     self.security_monitor_ready = false;
-                    self.status = "Windows 会话监控不可用，请手动锁定保险库".to_string();
+                    self.security_monitor_failed = true;
+                    self.lock_with_status(
+                        "Windows 会话监控初始化失败或已中断，保险库保持锁定；请重启软件后重试",
+                    );
                 }
                 SecurityEvent::SessionLocked => self.lock_with_status("Windows 锁屏，保险库已锁定"),
                 SecurityEvent::SessionLoggedOff => {
@@ -760,17 +931,9 @@ impl App {
                 }
                 SecurityEvent::SystemSuspending => self.lock_with_status("系统挂起，保险库已锁定"),
                 SecurityEvent::ClipboardCleanupFailed => {
-                    self.status = "剪贴板清理失败，请手动覆盖剪贴板".to_string()
+                    self.note_clipboard_cleanup_failure();
                 }
             },
-            Message::PasswordClipboardWritten => {
-                let sequence = platform::clipboard_sequence_number();
-                self.status =
-                    match platform::arm_clipboard_clear(sequence, PASSWORD_CLIPBOARD_TIMEOUT_MS) {
-                        Ok(()) => "已发送复制请求，30 秒后尝试条件清理剪贴板".to_string(),
-                        Err(error) => format!("已发送复制请求，自动清理未启用：{error}"),
-                    };
-            }
         }
         Task::none()
     }
@@ -783,7 +946,11 @@ fn replace_secret(target: &mut String, value: String) {
 
 impl Drop for App {
     fn drop(&mut self) {
-        let _ = platform::clear_armed_clipboard_now();
+        // Lock may already have relinquished the live token. The process-local
+        // barrier also covers that retired receipt and queued cleanup.
+        if platform::shutdown_clipboard().is_err() {
+            eprintln!("clipboard_cleanup_incomplete_on_exit");
+        }
         self.clear_password_fields();
     }
 }

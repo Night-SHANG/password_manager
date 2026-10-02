@@ -2,6 +2,9 @@ use super::*;
 
 impl App {
     pub(super) fn create_vault(&mut self) {
+        if !self.ensure_monitor_ready(cfg!(windows)) {
+            return;
+        }
         if self.master_password != self.confirm_password {
             self.status = "两次输入的主密码不一致".to_string();
             return;
@@ -10,26 +13,56 @@ impl App {
             Ok(session) => {
                 self.session = Some(session);
                 self.clear_password_fields();
-                self.reset_unlocked_state();
-                self.status = "新保险库已创建并加密".to_string();
+                let clipboard_ok = self.reset_unlocked_state();
+                self.status = session_status("新保险库已创建并加密", clipboard_ok);
             }
             Err(error) => self.status = format!("创建失败：{error}"),
         }
     }
 
     pub(super) fn open_vault(&mut self) {
+        if !self.ensure_monitor_ready(cfg!(windows)) {
+            return;
+        }
         match VaultSession::open(self.vault_path.clone(), &self.master_password) {
             Ok(session) => {
                 self.session = Some(session);
                 self.clear_password_fields();
-                self.reset_unlocked_state();
-                self.status = "保险库已解锁".to_string();
+                let clipboard_ok = self.reset_unlocked_state();
+                self.status = session_status("保险库已解锁", clipboard_ok);
             }
             Err(error) => self.status = format!("无法解锁：{error}"),
         }
     }
 
-    fn reset_unlocked_state(&mut self) {
+    pub(super) fn note_clipboard_cleanup_failure(&mut self) {
+        self.close_context();
+        if let Panel::Editor(editor) = &mut self.panel {
+            editor.password_visible = false;
+        }
+        self.clipboard_cleanup_failed = true;
+        self.clipboard_warning_generation = self.clipboard_warning_generation.wrapping_add(1);
+    }
+
+    pub(super) fn revoke_clipboard_session(&mut self) -> bool {
+        self.pending_editor_cut = None;
+        self.clipboard_request = self.clipboard_request.wrapping_add(1);
+        let success = self
+            .clipboard_session
+            .take()
+            .is_none_or(|permit| platform::revoke_and_clear_clipboard(&permit).is_ok());
+        if !success {
+            self.note_clipboard_cleanup_failure();
+        }
+        success
+    }
+
+    pub(super) fn reset_unlocked_state(&mut self) -> bool {
+        let clipboard_ok = self.revoke_clipboard_session();
+        if self.session.is_some() {
+            self.clipboard_session = Some(platform::begin_clipboard_session());
+        }
+        self.last_activity = std::time::Instant::now();
         self.invalidate_picker();
         self.nav = NavFilter::All;
         self.selected = None;
@@ -37,6 +70,7 @@ impl App {
         self.close_context();
         self.search.clear();
         self.category_name.clear();
+        clipboard_ok
     }
 
     pub(super) fn clear_password_fields(&mut self) {
@@ -47,12 +81,12 @@ impl App {
     }
 
     pub(super) fn lock_with_status(&mut self, status: &str) {
-        let _ = platform::clear_armed_clipboard_now();
+        let clipboard_ok = self.revoke_clipboard_session();
         self.session = None;
         self.reset_unlocked_state();
         self.clear_password_fields();
         self.creating = false;
-        self.status = status.to_string();
+        self.status = session_status(status, clipboard_ok);
     }
 
     pub(super) fn save_now(&mut self) {
@@ -132,7 +166,7 @@ impl App {
             Ok(id) => {
                 self.selected = Some(id);
                 self.panel = Panel::Vault;
-                self.revealed = None;
+                self.close_context();
                 self.status = "条目已安全保存".to_string();
             }
             Err(error) => self.status = format!("保存失败：{error}"),
@@ -140,6 +174,10 @@ impl App {
     }
 
     pub(super) fn toggle_reveal(&mut self) {
+        if !self.window_focused {
+            self.revealed = None;
+            return;
+        }
         let Some(id) = self
             .selected
             .filter(|id| self.context_open && self.is_visible_workspace_target(*id))
@@ -408,8 +446,8 @@ impl App {
             Ok(session) => {
                 self.session = Some(session);
                 self.vault_path = destination.display().to_string();
-                self.reset_unlocked_state();
-                self.status = "加密备份已恢复".to_string();
+                let clipboard_ok = self.reset_unlocked_state();
+                self.status = session_status("加密备份已恢复", clipboard_ok);
             }
             Err(error) => {
                 self.status = format!("恢复失败：{error}");
@@ -436,6 +474,7 @@ impl App {
     }
 
     pub(super) fn close_context(&mut self) {
+        self.pending_editor_cut = None;
         self.context_open = false;
         self.context_generation = self.context_generation.wrapping_add(1);
         self.revealed = None;
@@ -483,5 +522,13 @@ impl App {
                 Err(error)
             }
         }
+    }
+}
+
+fn session_status(status: &str, clipboard_ok: bool) -> String {
+    if clipboard_ok {
+        status.to_owned()
+    } else {
+        format!("{status}；敏感剪贴板清理请求失败，请手动覆盖剪贴板")
     }
 }

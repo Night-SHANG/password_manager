@@ -45,16 +45,24 @@ impl App {
             ),
             text("密码 *").size(13),
             row![
-                text_input("输入密码", &state.password)
-                    .on_input(Message::EditorPasswordChanged)
-                    .secure(!state.password_visible)
-                    .padding(10),
+                secret_input::managed_password_input(
+                    text_input("输入密码", &state.password)
+                        .id("editor-password-input")
+                        .on_input(Message::EditorPasswordChanged)
+                        .secure(!state.password_visible)
+                        .padding(10),
+                    self.context_generation,
+                    &state.password,
+                    state.password_visible,
+                ),
                 button(if state.password_visible {
                     "隐藏"
                 } else {
                     "显示"
                 })
-                .on_press(Message::ToggleEditorPasswordVisible)
+                .on_press(Message::ToggleEditorPasswordVisible(
+                    self.context_generation
+                ))
                 .style(button::secondary)
             ]
             .spacing(8),
@@ -236,6 +244,10 @@ impl App {
         let form = column![
             card(column![
                 text("外观与安全").size(18),
+                row![text("闲置自动锁定"), container(iced::widget::pick_list(&safety::IDLE_MINUTES[..], Some(self.idle_minutes), Message::IdleTimeoutChanged).width(100)).id("idle-timeout-setting"), text("分钟")].spacing(10).align_y(Alignment::Center),
+                text("只计算本应用内的键盘、点击、滚动等操作；Windows 锁屏/睡眠锁定不可关闭，依赖系统监控就绪。").size(12),
+                row![text("密码剪贴板清理"), container(iced::widget::pick_list(&safety::CLIPBOARD_SECONDS[..], Some(self.clipboard_seconds), Message::ClipboardTimeoutChanged).width(100)).id("clipboard-timeout-setting"), text("秒")].spacing(10).align_y(Alignment::Center),
+                text("仅清理仍由本次复制持有的内容；失焦会重新遮罩密码，不自动整库锁定。").size(12),
                 checkbox(self.dark_mode).label("深色模式（默认使用旧版浅色）").on_toggle(Message::DarkModeChanged),
                 checkbox(self.screen_capture_protection_requested).label("启用 Windows 常规截图保护").on_toggle(Message::ScreenCaptureProtectionChanged),
                 text(format!("截图保护：{} · 会话监控：{}", if self.screen_capture_protection_active { "已启用" } else { "未启用" }, if self.security_monitor_ready { "已就绪" } else { "未就绪" })).size(12),

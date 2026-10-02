@@ -1,5 +1,10 @@
 use std::path::Path;
 
+mod clipboard;
+#[cfg(any(windows, test))]
+mod security_monitor;
+pub use clipboard::{ClipboardCopyOutcome, ClipboardKind, ClipboardSession};
+
 use iced::{Subscription, Task};
 
 #[cfg(windows)]
@@ -13,6 +18,8 @@ use crate::AppError;
 #[cfg(windows)]
 use raw_window_handle::RawWindowHandle;
 
+#[cfg(any(windows, test))]
+mod windows_clipboard;
 #[cfg(windows)]
 mod windows_impl;
 #[cfg(windows)]
@@ -26,6 +33,12 @@ pub enum SecurityEvent {
     SessionLoggedOff,
     SystemSuspending,
     ClipboardCleanupFailed,
+    ClipboardCopyCompleted {
+        session: u64,
+        request: u64,
+        kind: ClipboardKind,
+        outcome: ClipboardCopyOutcome,
+    },
 }
 
 pub fn atomic_replace(target: &Path, replacement: &Path, backup: Option<&Path>) -> Result<()> {
@@ -64,15 +77,92 @@ pub(crate) fn atomic_create_new(target: &Path, replacement: tempfile::TempPath) 
     }
 }
 
-pub fn clipboard_sequence_number() -> u32 {
+/// A fresh, opaque write permit for one successful vault unlock.
+pub fn begin_clipboard_session() -> ClipboardSession {
     #[cfg(windows)]
     {
-        windows_impl::clipboard_sequence_number()
+        windows_impl::begin_clipboard_session()
     }
-
     #[cfg(not(windows))]
     {
-        0
+        ClipboardSession::new()
+    }
+}
+
+pub fn enqueue_password_copy(
+    session: &ClipboardSession,
+    request: u64,
+    text: zeroize::Zeroizing<String>,
+    timeout_ms: u32,
+) -> Result<()> {
+    #[cfg(windows)]
+    {
+        windows_impl::enqueue_copy(session, request, ClipboardKind::Password, text, timeout_ms)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (session, request, text, timeout_ms);
+        Err(AppError::Platform(
+            "native clipboard copying is unavailable on this platform".to_string(),
+        ))
+    }
+}
+
+pub fn enqueue_username_copy(session: &ClipboardSession, request: u64, text: String) -> Result<()> {
+    #[cfg(windows)]
+    {
+        windows_impl::enqueue_copy(
+            session,
+            request,
+            ClipboardKind::Username,
+            zeroize::Zeroizing::new(text),
+            30_000,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (session, request, text);
+        Err(AppError::Platform(
+            "native clipboard copying is unavailable on this platform".to_string(),
+        ))
+    }
+}
+
+/// Revocation is synchronous even when posting the native cleanup fails.
+pub fn revoke_and_clear_clipboard(session: &ClipboardSession) -> Result<()> {
+    session.revoke();
+    #[cfg(windows)]
+    {
+        windows_impl::queue_revoked_cleanup()
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(())
+    }
+}
+
+/// Revoke all process-local clipboard permits and flush the retained receipt.
+pub fn shutdown_clipboard() -> Result<()> {
+    #[cfg(windows)]
+    {
+        windows_impl::shutdown_clipboard()
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(())
+    }
+}
+
+/// Attempt receipt-bound cleanup before process exit, with a bounded wait.
+pub fn shutdown_clipboard_session(session: &ClipboardSession) -> Result<()> {
+    session.revoke_native();
+    #[cfg(windows)]
+    {
+        windows_impl::shutdown_clipboard_session(session)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(())
     }
 }
 
@@ -116,47 +206,8 @@ pub fn set_screen_capture_protection(enabled: bool) -> Task<std::result::Result<
     }
 }
 
-pub fn arm_clipboard_clear(expected_sequence: u32, timeout_ms: u32) -> Result<()> {
-    #[cfg(windows)]
-    {
-        windows_impl::arm_clipboard_clear(expected_sequence, timeout_ms)
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = (expected_sequence, timeout_ms);
-        Ok(())
-    }
-}
-
-pub fn clear_armed_clipboard_now() -> Result<()> {
-    #[cfg(windows)]
-    {
-        windows_impl::clear_armed_clipboard_now()
-    }
-
-    #[cfg(not(windows))]
-    {
-        Ok(())
-    }
-}
-
-#[cfg(any(windows, test))]
-pub(crate) fn should_clear_clipboard(expected_sequence: u32, current_sequence: u32) -> bool {
-    expected_sequence != 0 && expected_sequence == current_sequence
-}
-
 #[cfg(test)]
 mod tests {
-    use super::should_clear_clipboard;
-
-    #[test]
-    fn clipboard_cleanup_requires_same_nonzero_sequence() {
-        assert!(should_clear_clipboard(42, 42));
-        assert!(!should_clear_clipboard(42, 43));
-        assert!(!should_clear_clipboard(0, 0));
-    }
-
     #[cfg(unix)]
     #[test]
     fn exclusive_publication_preserves_staged_bytes_and_permissions() {

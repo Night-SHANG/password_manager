@@ -6,6 +6,7 @@ pub mod error;
 pub mod export;
 pub mod import;
 pub mod platform;
+pub mod preferences;
 pub mod security;
 pub mod services;
 pub mod smoke;
