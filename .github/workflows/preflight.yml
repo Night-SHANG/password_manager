@@ -124,6 +124,11 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - name: Test lock writeback before Windows build
+        shell: pwsh
+        env:
+          REQUIRE_PWSH_WRITEBACK_TESTS: "1"
+        run: python -m unittest discover -s tests/ci -p test_lock_writeback.py -v
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -231,7 +236,13 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/dev/rust-rewrite-v1'
         shell: pwsh
         run: |
-          if (git status --porcelain -- Cargo.lock) {
+          # Artifact LF bytes may look dirty against a Windows CRLF checkout.
+          # Only the normalized index determines whether a commit is needed.
+          git add -- Cargo.lock
+          if ($LASTEXITCODE -ne 0) { throw "Could not stage the checked lockfile." }
+          git diff --cached --quiet --no-ext-diff --no-textconv -- Cargo.lock
+          $lockDiff = $LASTEXITCODE
+          if ($lockDiff -eq 1) {
             $remote = git ls-remote --heads origin refs/heads/dev/rust-rewrite-v1
             if ($LASTEXITCODE -ne 0) { throw "Could not verify the current development branch." }
             $remoteSha = ($remote -split '\s+')[0]
@@ -240,12 +251,15 @@ jobs:
               exit 0
             }
             git config user.name "github-actions[bot]"
+            if ($LASTEXITCODE -ne 0) { throw "Could not set lockfile commit author." }
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add Cargo.lock
+            if ($LASTEXITCODE -ne 0) { throw "Could not set lockfile commit email." }
             git commit -m "build: lock GUI dependencies after verified preflight"
             if ($LASTEXITCODE -ne 0) { throw "Lockfile commit failed." }
             git push origin HEAD:refs/heads/dev/rust-rewrite-v1
             if ($LASTEXITCODE -ne 0) { throw "Lockfile push failed; no force push was attempted." }
-          } else {
+          } elseif ($lockDiff -eq 0) {
             Write-Host "The validated Cargo.lock is already committed."
+          } else {
+            throw "Could not compare the staged lockfile."
           }
