@@ -6,6 +6,7 @@ use iced::{Alignment, Color};
 
 use super::*;
 
+mod export_notice;
 mod forms;
 mod recovery;
 mod secret_input;
@@ -233,7 +234,7 @@ impl App {
         .into()
     }
 
-    pub(super) fn view(&self) -> Element<'_, Message> {
+    fn workspace_view(&self) -> Element<'_, Message> {
         let Some(session) = &self.session else {
             return self.locked_view();
         };

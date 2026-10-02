@@ -98,3 +98,11 @@ The script verifies the release hash, runs the packaged `--self-test`, records O
 
 Verified existing-file saves, bounded encrypted backup retention and the locked
 recovery workflow are documented in [Verified storage and recovery](docs/verified-storage-recovery.md).
+
+Plaintext CSV now uses exclusive creation, owned zeroizing serialization and an
+identity/content readback checkpoint. A failed export deliberately leaves its
+output alone and reports that empty, partial or complete plaintext may remain;
+a full-path warning survives lock/navigation and guards normal exit. Export
+remains synchronous, and forced termination can bypass the in-memory warning.
+Supported local filesystems and Windows path safety rejections are listed in
+[Owned CSV export](docs/owned-csv-export.md).

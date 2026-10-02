@@ -1756,3 +1756,194 @@ fn review_c3_matching_source_verification_keeps_live_session() {
     assert!(app.recovery.is_none());
     assert!(app.status.contains("校验通过"));
 }
+
+#[test]
+fn export_close_requests_reach_the_app() {
+    assert!(
+        safety::runtime_event(
+            iced::Event::Window(iced::window::Event::CloseRequested),
+            iced::event::Status::Ignored,
+            iced::window::Id::unique(),
+        )
+        .is_some(),
+        "normal close must be routed through the plaintext warning guard"
+    );
+}
+
+#[test]
+#[ignore = "headless GUI regression"]
+fn gui_export_failure_warning_survives_lock() {
+    let (dir, mut app) = fixture(1);
+    app.session.as_mut().unwrap().body_mut().entries[0]
+        .secret
+        .ciphertext
+        .clear();
+    let _ = app.update(Message::OpenSettings);
+    let _ = app.update(Message::CsvPathChanged(
+        dir.path().join("partial.csv").display().to_string(),
+    ));
+    let _ = app.update(Message::ConfirmPlaintextChanged(true));
+    let _ = app.update(Message::ExportPlaintextCsv);
+    let _ = app.update(Message::Lock);
+    let mut ui = simulator(&app, SIZES[0]);
+    assert!(
+        ui.find("明文导出未完成，文件可能仍然存在").is_ok(),
+        "a retained plaintext warning must survive lock and status replacement"
+    );
+}
+
+fn install_long_export_notice(app: &mut App) -> String {
+    let path = format!(
+        "/synthetic/{}/明文文件-尾部.csv",
+        "非常长的用户选择目录/".repeat(35)
+    );
+    app.finish_plaintext_export(Err(AppError::Export(Box::new(
+        crate::export::ExportFailure {
+            target: path.clone().into(),
+            stage: crate::export::Stage::VerifyPath,
+            cause: crate::export::Cause::IdentityChanged,
+            output: crate::export::OutputDisposition::MayRemain {
+                observation: crate::export::Observation {
+                    target: crate::export::ObservedTarget::TargetDifferent,
+                    error: None,
+                },
+            },
+        },
+    ))));
+    path
+}
+
+#[test]
+#[ignore = "headless GUI regression"]
+fn gui_export_warning_navigation_recovery_and_close_at_all_sizes() {
+    for size in SIZES {
+        let (_dir, mut app) = fixture(1);
+        let full_path = install_long_export_notice(&mut app);
+        let generation = app.export_notice.as_ref().unwrap().generation;
+        for phase in ["unlocked", "locked", "recovery"] {
+            if phase == "locked" {
+                let _ = app.update(Message::Lock);
+            }
+            if phase == "recovery" {
+                let _ = app.update(Message::OpenRecovery);
+            }
+            let mut ui = simulator(&app, size);
+            assert!(
+                ui.find("明文导出未完成，文件可能仍然存在")
+                    .unwrap()
+                    .visible_bounds()
+                    .is_some()
+            );
+            let button = ui.find("我已了解并会处理可能残留的明文").unwrap();
+            assert!(button.visible_bounds().is_some());
+            assert!(button.bounds().y + button.bounds().height <= size.1);
+            let path = ui.find(full_path.as_str()).unwrap();
+            assert_finite_rect(path.bounds());
+            assert!(
+                path.bounds().width < size.0 - 35.0,
+                "full path must wrap within the visible rail"
+            );
+            let viewport = ui
+                .find(selector::id("export-notice-scroll"))
+                .unwrap()
+                .bounds();
+            ui.point_at(viewport.center());
+            ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Pixels {
+                    x: 0.0,
+                    y: -10000.0,
+                },
+            })]);
+            assert!(
+                ui.find("失败阶段：VerifyPath · output identity does not match")
+                    .unwrap()
+                    .visible_bounds()
+                    .is_some(),
+                "tail of full path/details must be scroll accessible"
+            );
+            capture(&app, &format!("export-warning-{phase}"), size);
+            assert_eq!(app.export_notice.as_ref().unwrap().generation, generation);
+        }
+        let _ = app.update(Message::CloseRequested(iced::window::Id::unique()));
+        assert!(app.session.is_none());
+        capture(&app, "export-warning-close", size);
+        let mut ui = simulator(&app, size);
+        for label in ["保持打开", "我理解明文可能残留，仍然退出"] {
+            let target = ui.find(label).unwrap();
+            assert!(target.visible_bounds().is_some());
+            assert!(target.bounds().y + target.bounds().height <= size.1);
+        }
+        ui.click("保持打开").unwrap();
+        let messages = ui.into_messages().collect();
+        apply_messages(&mut app, messages);
+        assert!(app.export_close_prompt.is_none());
+        assert!(app.session.is_none());
+        assert!(app.export_notice.is_some());
+        let mut ui = simulator(&app, size);
+        ui.click("我已了解并会处理可能残留的明文").unwrap();
+        let messages = ui.into_messages().collect();
+        apply_messages(&mut app, messages);
+        assert!(app.export_notice.is_none());
+        install_long_export_notice(&mut app);
+        let _ = app.update(Message::AcknowledgeExportNotice(generation));
+        assert!(app.export_notice.is_some());
+        let _ = app.update(Message::CloseRequested(iced::window::Id::unique()));
+        let mut ui = simulator(&app, size);
+        ui.click("我理解明文可能残留，仍然退出").unwrap();
+        let messages: Vec<_> = ui.into_messages().collect();
+        assert_eq!(messages.len(), 1);
+        for message in messages {
+            assert!(app.update(message).units() > 0);
+        }
+        assert!(app.export_close_prompt.is_none());
+        assert!(app.export_notice.is_some());
+    }
+}
+
+#[test]
+#[ignore = "headless GUI regression"]
+fn gui_export_repeat_button_is_disabled_until_current_notice_acknowledged() {
+    let (_dir, mut app) = fixture(1);
+    let _ = app.update(Message::OpenSettings);
+    let _ = app.update(Message::ConfirmPlaintextChanged(true));
+    install_long_export_notice(&mut app);
+    let mut ui = simulator(&app, SIZES[0]);
+    scroll_picker_into_view(&mut ui, "导出明文 CSV", SIZES[0]);
+    ui.click("导出明文 CSV").unwrap();
+    assert!(
+        !ui.into_messages()
+            .any(|message| matches!(message, Message::ExportPlaintextCsv))
+    );
+    let generation = app.export_notice.as_ref().unwrap().generation;
+    let _ = app.update(Message::AcknowledgeExportNotice(generation));
+    let mut ui = simulator(&app, SIZES[0]);
+    scroll_picker_into_view(&mut ui, "导出明文 CSV", SIZES[0]);
+    ui.click("导出明文 CSV").unwrap();
+    assert!(
+        ui.into_messages()
+            .any(|message| matches!(message, Message::ExportPlaintextCsv))
+    );
+}
+
+#[test]
+#[ignore = "headless GUI regression"]
+fn gui_export_close_warning_keeps_clipboard_acknowledgment_usable() {
+    for size in SIZES {
+        let (_dir, mut app) = fixture(0);
+        install_long_export_notice(&mut app);
+        app.note_clipboard_cleanup_failure();
+        let _ = app.update(Message::CloseRequested(iced::window::Id::unique()));
+        capture(&app, "export-warning-close-clipboard", size);
+        let mut ui = simulator(&app, size);
+        let button = ui.find("我已手动处理剪贴板").unwrap();
+        assert!(button.visible_bounds().is_some());
+        assert!(button.bounds().y + button.bounds().height <= size.1);
+        ui.click("我已手动处理剪贴板").unwrap();
+        let messages = ui.into_messages().collect();
+        apply_messages(&mut app, messages);
+        assert!(!app.clipboard_cleanup_failed);
+        assert!(app.export_notice.is_some());
+        assert!(app.export_close_prompt.is_some());
+        assert!(app.session.is_none());
+    }
+}

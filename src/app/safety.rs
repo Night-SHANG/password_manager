@@ -97,11 +97,14 @@ impl App {
 pub(super) fn runtime_event(
     event: iced::Event,
     _status: iced::event::Status,
-    _window: iced::window::Id,
+    window: iced::window::Id,
 ) -> Option<Message> {
     // Captured input is still user activity. Redraws, timers, pointer movement,
     // background completions and focus changes must not extend the deadline.
     match event {
+        iced::Event::Window(iced::window::Event::CloseRequested) => {
+            Some(Message::CloseRequested(window))
+        }
         iced::Event::Window(iced::window::Event::Focused) => {
             Some(Message::WindowFocusChanged(true))
         }

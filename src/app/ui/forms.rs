@@ -279,7 +279,7 @@ impl App {
                 text("兼容导出：明文 CSV").size(18),
                 self.path_field("导出路径", "新的 .csv 文件", &state.csv_path, Message::CsvPathChanged, picker::Purpose::Csv),
                 checkbox(state.confirm_plaintext).label("我理解导出文件中的密码和备注没有加密").on_toggle(Message::ConfirmPlaintextChanged),
-                button("导出明文 CSV").on_press_maybe((state.confirm_plaintext && self.picker_pending.is_none()).then_some(Message::ExportPlaintextCsv)).style(button::danger),
+                button("导出明文 CSV").on_press_maybe((state.confirm_plaintext && self.picker_pending.is_none() && self.export_notice.is_none()).then_some(Message::ExportPlaintextCsv)).style(button::danger),
             ].spacing(12)),
             text(format!("版本 {} · 条目 {} · Revision {}", env!("CARGO_PKG_VERSION"), session.active_entries().count(), session.revision())).size(12),
             text(format!("保险库：{}", session.path().display())).size(12),

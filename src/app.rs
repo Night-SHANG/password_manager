@@ -20,6 +20,7 @@ use crate::storage::VaultSession;
 use crate::{AppError, Result};
 
 mod actions;
+mod export_notice;
 mod picker;
 mod recovery;
 mod safety;
@@ -40,6 +41,7 @@ pub fn run() -> iced::Result {
         .window(iced::window::Settings {
             size: iced::Size::new(1280.0, 800.0),
             min_size: Some(iced::Size::new(960.0, 640.0)),
+            exit_on_close_request: false,
             ..iced::window::Settings::default()
         })
         .subscription(App::subscription)
@@ -48,6 +50,11 @@ pub fn run() -> iced::Result {
 }
 
 struct App {
+    closing: bool,
+    export_notice: Option<export_notice::ExportNotice>,
+    export_notice_generation: u64,
+    export_close_prompt: Option<export_notice::ExportClosePrompt>,
+    export_close_sequence: u64,
     pending_editor_cut: Option<PendingEditorCut>,
     clipboard_cleanup_failed: bool,
     clipboard_warning_generation: u64,
@@ -323,6 +330,10 @@ enum Message {
     CsvPathChanged(String),
     ConfirmPlaintextChanged(bool),
     ExportPlaintextCsv,
+    AcknowledgeExportNotice(u64),
+    CloseRequested(iced::window::Id),
+    KeepOpen(u64),
+    ConfirmExportExit(u64, u64),
     DarkModeChanged(bool),
     ScreenCaptureProtectionChanged(bool),
     ScreenCaptureProtectionApplied(std::result::Result<bool, String>),
@@ -342,6 +353,11 @@ impl std::fmt::Debug for Message {
 impl App {
     fn initial() -> Self {
         Self {
+            closing: false,
+            export_notice: None,
+            export_notice_generation: 0,
+            export_close_prompt: None,
+            export_close_sequence: 0,
             pending_editor_cut: None,
             clipboard_cleanup_failed: false,
             clipboard_warning_generation: 0,
@@ -461,6 +477,41 @@ impl App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         self.security_tick(std::time::Instant::now());
+        // Iced processes a message batch before executing window actions. Once
+        // final close is admitted, no later message may unlock or start work.
+        if self.closing
+            && !matches!(
+                &message,
+                Message::PlatformSecurity(_)
+                    | Message::SecurityTick(_)
+                    | Message::WindowFocusChanged(_)
+                    | Message::PathPicked(_, _)
+                    | Message::ScreenCaptureProtectionApplied(_)
+                    | Message::AcknowledgeClipboardCleanup(_)
+            )
+        {
+            return Task::none();
+        }
+        // A close warning masks the vault and cannot be bypassed by queued
+        // unlock/navigation/export or export acknowledgment from the old view.
+        // Retired picker/settings completions still drain, and the independently
+        // generation-checked clipboard warning remains actionable.
+        if self.export_close_prompt.is_some()
+            && !matches!(
+                &message,
+                Message::CloseRequested(_)
+                    | Message::KeepOpen(_)
+                    | Message::ConfirmExportExit(_, _)
+                    | Message::PlatformSecurity(_)
+                    | Message::SecurityTick(_)
+                    | Message::WindowFocusChanged(_)
+                    | Message::PathPicked(_, _)
+                    | Message::ScreenCaptureProtectionApplied(_)
+                    | Message::AcknowledgeClipboardCleanup(_)
+            )
+        {
+            return Task::none();
+        }
         if self.picker_pending.is_some()
             && matches!(
                 &message,
@@ -525,6 +576,12 @@ impl App {
             return Task::none();
         }
         match message {
+            Message::AcknowledgeExportNotice(generation) => self.acknowledge_export(generation),
+            Message::CloseRequested(window) => return self.request_close(window),
+            Message::KeepOpen(request) => self.keep_open(request),
+            Message::ConfirmExportExit(request, generation) => {
+                return self.confirm_export_exit(request, generation);
+            }
             Message::AcknowledgeClipboardCleanup(generation) => {
                 if generation == self.clipboard_warning_generation {
                     self.clipboard_cleanup_failed = false;

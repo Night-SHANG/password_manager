@@ -215,6 +215,25 @@ impl VaultSession {
         self.body.entries.iter().filter(|entry| !entry.is_deleted())
     }
 
+    /// Storage-owned traversal: no ID lookup and no arbitrary-entry decrypt API.
+    pub(crate) fn active_entries_with_secrets(
+        &self,
+    ) -> impl Iterator<Item = Result<(&EntryRecord, SecretPayload)>> {
+        self.body
+            .entries
+            .iter()
+            .inspect(|_| {
+                #[cfg(test)]
+                export_probe::visit();
+            })
+            .filter(|entry| !entry.is_deleted())
+            .map(|entry| {
+                #[cfg(test)]
+                export_probe::decrypt();
+                self.open_secret(entry).map(|secret| (entry, secret))
+            })
+    }
+
     pub fn add_entry(&mut self, draft: EntryDraft) -> Result<Uuid> {
         self.ensure_category(&draft.category);
         let id = Uuid::new_v4();
@@ -262,6 +281,8 @@ impl VaultSession {
     }
 
     pub fn reveal_secret(&self, id: Uuid) -> Result<SecretPayload> {
+        #[cfg(test)]
+        export_probe::lookup();
         let entry = self
             .body
             .entries
@@ -1140,3 +1161,33 @@ mod tests {
 
 #[cfg(test)]
 mod transaction_tests;
+
+#[cfg(test)]
+pub(crate) mod export_probe {
+    use std::cell::Cell;
+    thread_local! { static COUNTS: Cell<(usize, usize, usize)> = const { Cell::new((0,0,0)) }; }
+    pub fn reset() {
+        COUNTS.with(|c| c.set((0, 0, 0)));
+    }
+    pub fn counts() -> (usize, usize, usize) {
+        COUNTS.with(Cell::get)
+    }
+    pub(super) fn visit() {
+        COUNTS.with(|c| {
+            let (v, d, l) = c.get();
+            c.set((v + 1, d, l));
+        });
+    }
+    pub(super) fn decrypt() {
+        COUNTS.with(|c| {
+            let (v, d, l) = c.get();
+            c.set((v, d + 1, l));
+        });
+    }
+    pub(super) fn lookup() {
+        COUNTS.with(|c| {
+            let (v, d, l) = c.get();
+            c.set((v, d, l + 1));
+        });
+    }
+}

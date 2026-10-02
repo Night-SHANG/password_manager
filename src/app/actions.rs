@@ -468,6 +468,9 @@ impl App {
     }
 
     pub(super) fn export_plaintext(&mut self) {
+        if self.export_notice.is_some() {
+            return;
+        }
         let (Some(session), Panel::Settings(state)) = (&self.session, &self.panel) else {
             return;
         };
@@ -475,14 +478,12 @@ impl App {
             self.status = "请先确认明文 CSV 的风险".to_string();
             return;
         }
-        self.status = match export_plaintext_csv(
+        let result = export_plaintext_csv(
             session,
             Path::new(&state.csv_path),
             PlaintextExportAcknowledgement::user_confirmed_risk(),
-        ) {
-            Ok(count) => format!("已导出 {count} 条到明文 CSV，请妥善保护导出文件"),
-            Err(error) => format!("导出失败：{error}"),
-        };
+        );
+        self.finish_plaintext_export(result);
     }
 
     pub(super) fn close_context(&mut self) {

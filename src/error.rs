@@ -36,6 +36,9 @@ pub enum AppError {
     #[error(transparent)]
     Persist(Box<crate::storage::transaction::PersistFailure>),
 
+    #[error(transparent)]
+    Export(Box<crate::export::ExportFailure>),
+
     #[error("the vault changed on disk after it was opened")]
     ExternalChange,
 
