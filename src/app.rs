@@ -20,6 +20,7 @@ use crate::storage::VaultSession;
 use crate::{AppError, Result};
 
 mod actions;
+mod picker;
 #[cfg(test)]
 mod tests;
 mod ui;
@@ -46,6 +47,8 @@ pub fn run() -> iced::Result {
 }
 
 struct App {
+    picker_pending: Option<picker::Pending>,
+    picker_sequence: u64,
     vault_path: String,
     master_password: String,
     confirm_password: String,
@@ -214,6 +217,8 @@ enum ContextActionKind {
 
 #[derive(Clone)]
 enum Message {
+    PickPath(picker::Purpose),
+    PathPicked(u64, std::result::Result<Option<std::path::PathBuf>, String>),
     AuthMode(bool),
     ToggleAuthOptions,
     ToggleCategoryEditor,
@@ -297,6 +302,8 @@ impl std::fmt::Debug for Message {
 impl App {
     fn initial() -> Self {
         Self {
+            picker_pending: None,
+            picker_sequence: 0,
             vault_path: "passwords.pmvault".to_string(),
             master_password: String::new(),
             confirm_password: String::new(),
@@ -381,6 +388,50 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if self.picker_pending.is_some()
+            && matches!(
+                &message,
+                Message::CreateVault
+                    | Message::OpenVault
+                    | Message::AnalyzeImport
+                    | Message::ApplyImport
+                    | Message::CreateBackup
+                    | Message::RestoreBackup
+                    | Message::ExportPlaintextCsv
+            )
+        {
+            return Task::none();
+        }
+        // Invalidate, but retain the in-flight slot until the OS dialog returns.
+        // This rejects stale results while preventing multiple native dialogs.
+        if matches!(
+            &message,
+            Message::AuthMode(_)
+                | Message::ToggleAuthOptions
+                | Message::Lock
+                | Message::SetNav(_)
+                | Message::CancelPanel
+                | Message::NewEntry
+                | Message::EditEntry(_)
+                | Message::EditSelected
+                | Message::OpenImport
+                | Message::OpenSettings
+                | Message::RequestDeleteCategory(_)
+                | Message::VaultPathChanged(_)
+                | Message::ImportPathChanged(_)
+                | Message::BackupPathChanged(_)
+                | Message::RestorePathChanged(_)
+                | Message::CsvPathChanged(_)
+                | Message::CreateVault
+                | Message::OpenVault
+                | Message::AnalyzeImport
+                | Message::ApplyImport
+                | Message::CreateBackup
+                | Message::RestoreBackup
+                | Message::ExportPlaintextCsv
+        ) {
+            self.invalidate_picker();
+        }
         // A queued detail action must not operate on a selection that is now
         // hidden, locked, or outside the password workspace.
         if matches!(
@@ -400,6 +451,8 @@ impl App {
             return Task::none();
         }
         match message {
+            Message::PickPath(purpose) => return self.begin_picker(purpose),
+            Message::PathPicked(id, result) => self.finish_picker(id, result),
             Message::AuthMode(creating) => {
                 self.creating = creating;
                 self.clear_password_fields();
@@ -606,6 +659,8 @@ impl App {
                     s.path = value;
                     s.preview = None;
                     s.resolutions.clear();
+                    s.legacy_password.zeroize();
+                    s.legacy_password.clear();
                 }
             }
             Message::ImportLegacyPasswordChanged(value) => {
@@ -640,6 +695,9 @@ impl App {
             Message::RestorePathChanged(value) => {
                 if let Panel::Settings(s) = &mut self.panel {
                     s.restore_path = value;
+                    s.confirm_restore = false;
+                    s.restore_password.zeroize();
+                    s.restore_password.clear();
                 }
             }
             Message::RestorePasswordChanged(value) => {
@@ -656,6 +714,7 @@ impl App {
             Message::CsvPathChanged(value) => {
                 if let Panel::Settings(s) = &mut self.panel {
                     s.csv_path = value;
+                    s.confirm_plaintext = false;
                 }
             }
             Message::ConfirmPlaintextChanged(value) => {

@@ -556,3 +556,135 @@ fn gui_context_actions_keep_their_original_target() {
         }
     }
 }
+
+#[test]
+#[ignore = "headless GUI regression"]
+fn gui_native_picker_entry_points_are_available() {
+    let (_dir, mut app) = fixture(0);
+    let session = app.session.take();
+    for size in SIZES {
+        for creating in [false, true] {
+            let _ = app.update(Message::AuthMode(creating));
+            app.auth_options_open = true;
+            let label = if creating {
+                "选择新建位置"
+            } else {
+                "选择保险库文件"
+            };
+            let mut ui = simulator(&app, size);
+            ui.click(label).expect("auth picker button missing");
+            let purpose = if creating {
+                picker::Purpose::CreateVault
+            } else {
+                picker::Purpose::OpenVault
+            };
+            let messages: Vec<_> = ui.into_messages().collect();
+            assert!(
+                matches!(messages.first(), Some(Message::PickPath(actual)) if *actual == purpose)
+            );
+            apply_messages(&mut app, messages);
+            assert!(app.picker_pending.is_some());
+            let mut ui = simulator(&app, size);
+            ui.click(label).unwrap();
+            assert_eq!(ui.into_messages().count(), 0);
+            let _ = app.update(Message::PathPicked(app.picker_sequence, Ok(None)));
+            assert!(app.picker_pending.is_none());
+            app.status.clear();
+            capture(
+                &app,
+                if creating {
+                    "picker-create"
+                } else {
+                    "picker-open"
+                },
+                size,
+            );
+        }
+    }
+    app.session = session;
+    for size in SIZES {
+        for (purpose, label) in [
+            (picker::Purpose::Import, "选择导入文件"),
+            (picker::Purpose::Backup, "选择备份位置"),
+            (picker::Purpose::Restore, "选择恢复文件"),
+            (picker::Purpose::Csv, "选择 CSV 导出位置"),
+        ] {
+            let _ = app.update(if purpose == picker::Purpose::Import {
+                Message::OpenImport
+            } else {
+                Message::OpenSettings
+            });
+            let messages = {
+                let mut ui = simulator(&app, size);
+                scroll_picker_into_view(&mut ui, label, size);
+                let target = ui.find(label).unwrap();
+                let visible = target.visible_bounds().expect("picker label hidden");
+                assert!((visible.height - target.bounds().height).abs() < 0.1);
+                assert!(
+                    ui.snapshot(&app.theme())
+                        .unwrap()
+                        .matches_image(format!(
+                            "target/gui-artifacts/picker-{purpose:?}-{}.png",
+                            size.0 as u32
+                        ))
+                        .unwrap()
+                );
+                ui.click(label).unwrap();
+                ui.into_messages().collect::<Vec<_>>()
+            };
+            assert!(
+                matches!(messages.first(), Some(Message::PickPath(actual)) if *actual == purpose)
+            );
+            apply_messages(&mut app, messages);
+            assert!(app.picker_pending.is_some());
+            let mut ui = simulator(&app, size);
+            scroll_picker_into_view(&mut ui, label, size);
+            ui.click(label).unwrap();
+            assert_eq!(
+                ui.into_messages().count(),
+                0,
+                "pending picker button still enabled"
+            );
+            // Cancel through the same result message delivered by the native task.
+            let _ = app.update(Message::PathPicked(app.picker_sequence, Ok(None)));
+            assert!(app.picker_pending.is_none());
+        }
+    }
+}
+
+fn scroll_picker_into_view(ui: &mut Simulator<'_, Message>, label: &str, size: (f32, f32)) {
+    let bounds = ui.find(label).unwrap().bounds();
+    let amount = (bounds.center_y() - size.1 / 2.0).max(0.0);
+    ui.point_at(iced::Point::new(size.0 - 100.0, size.1 / 2.0));
+    ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+        delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -amount },
+    })]);
+}
+
+#[test]
+#[ignore = "headless GUI regression"]
+fn gui_picker_path_fields_stay_clear_of_auth_scrollbar() {
+    for creating in [false, true] {
+        let mut app = App::initial();
+        app.creating = creating;
+        app.auth_options_open = true;
+        app.status = "合成测试状态 ".repeat(100);
+        for size in SIZES {
+            let mut ui = simulator(&app, size);
+            let viewport = ui.find(selector::id("auth-scroll")).unwrap().bounds();
+            let purpose = if creating {
+                picker::Purpose::CreateVault
+            } else {
+                picker::Purpose::OpenVault
+            };
+            let field = ui
+                .find(selector::id(format!("picker-field-{purpose:?}")))
+                .unwrap()
+                .bounds();
+            assert!(
+                field.x + field.width <= viewport.x + viewport.width - 18.0 + 0.1,
+                "path field overlaps scrollbar: field={field:?} viewport={viewport:?}"
+            );
+        }
+    }
+}

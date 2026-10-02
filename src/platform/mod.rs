@@ -15,6 +15,8 @@ use raw_window_handle::RawWindowHandle;
 
 #[cfg(windows)]
 mod windows_impl;
+#[cfg(windows)]
+mod windows_new_file;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecurityEvent {
@@ -37,6 +39,28 @@ pub fn atomic_replace(target: &Path, replacement: &Path, backup: Option<&Path>) 
         let _ = backup;
         std::fs::rename(replacement, target)
             .map_err(|error| AppError::io(target.to_path_buf(), error))
+    }
+}
+
+/// Publish a fully written, synced sibling temporary file without replacing any
+/// existing destination. The temporary file is cleaned up on publication failure.
+pub(crate) fn atomic_create_new(target: &Path, replacement: tempfile::TempPath) -> Result<()> {
+    #[cfg(windows)]
+    {
+        windows_new_file::atomic_create_new(target, &replacement)
+    }
+
+    #[cfg(not(windows))]
+    {
+        // Uses an exclusive rename where supported, otherwise an exclusive hard
+        // link. Neither operation can overwrite a destination created concurrently.
+        replacement.persist_noclobber(target).map_err(|error| {
+            if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+                AppError::AlreadyExists
+            } else {
+                AppError::io(target.to_path_buf(), error.error)
+            }
+        })
     }
 }
 
@@ -131,5 +155,34 @@ mod tests {
         assert!(should_clear_clipboard(42, 42));
         assert!(!should_clear_clipboard(42, 43));
         assert!(!should_clear_clipboard(0, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_publication_preserves_staged_bytes_and_permissions() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("new.pmvault");
+        let mut staged = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        staged.write_all(b"fully written encrypted bytes").unwrap();
+        staged
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o640))
+            .unwrap();
+        staged.as_file().sync_all().unwrap();
+
+        super::atomic_create_new(&target, staged.into_temp_path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"fully written encrypted bytes"
+        );
+        assert_eq!(
+            std::fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

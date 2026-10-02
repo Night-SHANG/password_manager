@@ -30,6 +30,7 @@ impl App {
     }
 
     fn reset_unlocked_state(&mut self) {
+        self.invalidate_picker();
         self.nav = NavFilter::All;
         self.selected = None;
         self.panel = Panel::Vault;

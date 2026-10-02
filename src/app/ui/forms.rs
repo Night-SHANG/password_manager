@@ -105,11 +105,12 @@ impl App {
     ) -> Element<'a, Message> {
         let mut form = column![
             text("支持 Chrome CSV、旧版 CSV、vault.enc 和 passwords.db。源文件只读。").size(13),
-            field(
+            self.path_field(
                 "导入文件路径",
                 "密码导出文件路径",
                 &state.path,
-                Message::ImportPathChanged
+                Message::ImportPathChanged,
+                picker::Purpose::Import,
             ),
             secret_field(
                 "旧主密码（仅旧版加密格式需要）",
@@ -117,7 +118,11 @@ impl App {
                 Message::ImportLegacyPasswordChanged
             ),
             button("分析并预览")
-                .on_press(Message::AnalyzeImport)
+                .on_press_maybe(
+                    self.picker_pending
+                        .is_none()
+                        .then_some(Message::AnalyzeImport)
+                )
                 .padding(10),
         ]
         .spacing(14);
@@ -210,7 +215,10 @@ impl App {
             }
             form = form.push(
                 button("执行导入")
-                    .on_press_maybe((unresolved == 0).then_some(Message::ApplyImport))
+                    .on_press_maybe(
+                        (unresolved == 0 && self.picker_pending.is_none())
+                            .then_some(Message::ApplyImport),
+                    )
                     .padding(10),
             );
             if unresolved > 0 {
@@ -235,19 +243,19 @@ impl App {
             ].spacing(12)),
             card(column![
                 text("加密备份").size(18),
-                field("备份目标路径", "新的 .pmvault 文件", &state.backup_path, Message::BackupPathChanged),
-                button("创建加密备份").on_press(Message::CreateBackup),
+                self.path_field("备份目标路径", "新的 .pmvault 文件", &state.backup_path, Message::BackupPathChanged, picker::Purpose::Backup),
+                button("创建加密备份").on_press_maybe(self.picker_pending.is_none().then_some(Message::CreateBackup)),
                 text("恢复并替换当前保险库").size(16),
-                field("备份文件路径", "已有备份的完整路径", &state.restore_path, Message::RestorePathChanged),
+                self.path_field("备份文件路径", "已有备份的完整路径", &state.restore_path, Message::RestorePathChanged, picker::Purpose::Restore),
                 secret_field("备份的主密码", &state.restore_password, Message::RestorePasswordChanged),
                 checkbox(state.confirm_restore).label("确认用备份替换当前保险库（不是合并导入）").on_toggle(Message::ConfirmRestoreChanged),
-                button("恢复备份").on_press_maybe(state.confirm_restore.then_some(Message::RestoreBackup)).style(button::danger),
+                button("恢复备份").on_press_maybe((state.confirm_restore && self.picker_pending.is_none()).then_some(Message::RestoreBackup)).style(button::danger),
             ].spacing(12)),
             card(column![
                 text("兼容导出：明文 CSV").size(18),
-                field("导出路径", "新的 .csv 文件", &state.csv_path, Message::CsvPathChanged),
+                self.path_field("导出路径", "新的 .csv 文件", &state.csv_path, Message::CsvPathChanged, picker::Purpose::Csv),
                 checkbox(state.confirm_plaintext).label("我理解导出文件中的密码和备注没有加密").on_toggle(Message::ConfirmPlaintextChanged),
-                button("导出明文 CSV").on_press_maybe(state.confirm_plaintext.then_some(Message::ExportPlaintextCsv)).style(button::danger),
+                button("导出明文 CSV").on_press_maybe((state.confirm_plaintext && self.picker_pending.is_none()).then_some(Message::ExportPlaintextCsv)).style(button::danger),
             ].spacing(12)),
             text(format!("版本 {} · 条目 {} · Revision {}", env!("CARGO_PKG_VERSION"), session.active_entries().count(), session.revision())).size(12),
             text(format!("保险库：{}", session.path().display())).size(12),

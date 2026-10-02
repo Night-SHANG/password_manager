@@ -170,6 +170,40 @@ fn metadata_details(entry: &EntryRecord) -> Element<'_, Message> {
 }
 
 impl App {
+    fn path_field<'a>(
+        &'a self,
+        label: &'a str,
+        hint: &'a str,
+        value: &'a str,
+        message: impl Fn(String) -> Message + 'a,
+        purpose: picker::Purpose,
+    ) -> Element<'a, Message> {
+        let label_button = match purpose {
+            picker::Purpose::OpenVault => "选择保险库文件",
+            picker::Purpose::CreateVault => "选择新建位置",
+            picker::Purpose::Import => "选择导入文件",
+            picker::Purpose::Backup => "选择备份位置",
+            picker::Purpose::Restore => "选择恢复文件",
+            picker::Purpose::Csv => "选择 CSV 导出位置",
+        };
+        container(
+            column![
+                field(label, hint, value, message),
+                button(label_button)
+                    .on_press_maybe(
+                        (self.picker_pending.is_none() && self.picker_allowed(purpose))
+                            .then_some(Message::PickPath(purpose))
+                    )
+                    .style(button::secondary)
+                    .padding(8),
+            ]
+            .spacing(6),
+        )
+        .id(format!("picker-field-{purpose:?}"))
+        .width(Length::Fill)
+        .into()
+    }
+
     pub(super) fn view(&self) -> Element<'_, Message> {
         let Some(session) = &self.session else {
             return self.locked_view();
@@ -277,11 +311,16 @@ impl App {
             ));
         }
         if self.creating || self.auth_options_open {
-            form = form.push(field(
+            form = form.push(self.path_field(
                 "保险库文件路径",
                 "例如 D:\\Passwords\\main.pmvault",
                 &self.vault_path,
                 Message::VaultPathChanged,
+                if self.creating {
+                    picker::Purpose::CreateVault
+                } else {
+                    picker::Purpose::OpenVault
+                },
             ));
         }
         form = form
@@ -291,7 +330,7 @@ impl App {
                 } else {
                     "解 锁"
                 }))
-                .on_press(submit)
+                .on_press_maybe(self.picker_pending.is_none().then_some(submit))
                 .padding(14)
                 .width(Length::Fill),
             )
@@ -323,20 +362,25 @@ impl App {
         }
         // Bound the card first, then center it in the full viewport. Only its
         // contents scroll on smaller windows; no unbounded horizontal layout.
-        let auth = container(scrollable(form).height(Length::Shrink))
-            .id("auth-card")
-            .width(400)
-            .max_height(580)
-            .padding(if self.creating { 24 } else { 32 })
-            .style(|theme: &Theme| {
-                let mut style = surface(theme);
-                style.shadow = iced::Shadow {
-                    color: Color::from_rgba(0.0, 0.0, 0.0, 0.16),
-                    offset: iced::Vector::new(0.0, 16.0),
-                    blur_radius: 30.0,
-                };
-                style
-            });
+        let auth = container(
+            scrollable(form.padding(iced::Padding::ZERO.bottom(8)))
+                .spacing(8)
+                .id("auth-scroll")
+                .height(Length::Shrink),
+        )
+        .id("auth-card")
+        .width(400)
+        .max_height(580)
+        .padding(if self.creating { 24 } else { 32 })
+        .style(|theme: &Theme| {
+            let mut style = surface(theme);
+            style.shadow = iced::Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.16),
+                offset: iced::Vector::new(0.0, 16.0),
+                blur_radius: 30.0,
+            };
+            style
+        });
         container(auth)
             .padding(24)
             .center_x(Length::Fill)
