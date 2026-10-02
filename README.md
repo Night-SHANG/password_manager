@@ -95,3 +95,6 @@ powershell -ExecutionPolicy Bypass -File .\scripts\windows10-l4.ps1 -ReleaseDire
 ```
 
 The script verifies the release hash, runs the packaged `--self-test`, records OS/build information, and creates the manual acceptance report for DPI, Chinese IME, Unicode, screenshot protection, clipboard behavior, session lock/suspend, backup/restore, and import/reimport flows.
+
+Verified existing-file saves, bounded encrypted backup retention and the locked
+recovery workflow are documented in [Verified storage and recovery](docs/verified-storage-recovery.md).

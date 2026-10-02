@@ -7,6 +7,7 @@ use iced::{Alignment, Color};
 use super::*;
 
 mod forms;
+mod recovery;
 mod secret_input;
 
 #[cfg(test)]
@@ -204,10 +205,19 @@ impl App {
             picker::Purpose::Backup => "选择备份位置",
             picker::Purpose::Restore => "选择恢复文件",
             picker::Purpose::Csv => "选择 CSV 导出位置",
+            picker::Purpose::RecoverySource => "选择恢复副本",
+            picker::Purpose::RecoveryDestination => "选择新文件位置",
         };
         container(
             column![
-                field(label, hint, value, message),
+                column![
+                    text(label).size(13),
+                    text_input(hint, value)
+                        .id(format!("path-{purpose:?}"))
+                        .on_input(message)
+                        .padding(10)
+                ]
+                .spacing(5),
                 button(label_button)
                     .on_press_maybe(
                         (self.picker_pending.is_none() && self.picker_allowed(purpose))
@@ -291,6 +301,13 @@ impl App {
     }
 
     fn locked_view(&self) -> Element<'_, Message> {
+        if let Some(state) = &self.recovery {
+            return container(self.recovery_view(state))
+                .padding(20)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .into();
+        }
         let submit = if self.creating {
             Message::CreateVault
         } else {
@@ -393,6 +410,13 @@ impl App {
                     "正在等待系统监控就绪…"
                 })
                 .size(12),
+            );
+        }
+        if !self.creating {
+            form = form.push(
+                button("检查恢复副本")
+                    .on_press(Message::OpenRecovery)
+                    .style(button::text),
             );
         }
         form = form.push(text("本地加密 · 测试版本，请勿作为唯一密码副本").size(11));

@@ -33,6 +33,9 @@ pub enum AppError {
     #[error("KDF parameters are outside the accepted safety bounds")]
     InvalidKdf,
 
+    #[error(transparent)]
+    Persist(Box<crate::storage::transaction::PersistFailure>),
+
     #[error("the vault changed on disk after it was opened")]
     ExternalChange,
 
@@ -50,6 +53,11 @@ pub enum AppError {
 }
 
 impl AppError {
+    pub fn invalidates_session(&self) -> bool {
+        matches!(self, Self::ExternalChange)
+            || matches!(self, Self::Persist(failure) if failure.invalidates_session())
+    }
+
     pub fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         Self::Io {
             path: path.into(),

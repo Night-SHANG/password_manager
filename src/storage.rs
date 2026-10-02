@@ -1,12 +1,12 @@
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs;
+
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::domain::{
     BODY_SCHEMA_VERSION, EntryDraft, EntryRecord, SecretEnvelope, SecretPayload, VaultBody,
@@ -16,6 +16,10 @@ use crate::security::{
     self, KdfConfig, NONCE_LEN, SALT_LEN, VaultKeys, derive_kek, open, random_array, seal,
 };
 use crate::{AppError, Result};
+
+mod bounded;
+pub mod recovery;
+pub mod transaction;
 
 const MAGIC: &str = "PMVAULT";
 const FORMAT_VERSION: u32 = 1;
@@ -50,6 +54,9 @@ pub struct VaultSession {
     body: VaultBody,
     keys: VaultKeys,
     source_hash: [u8; 32],
+    source_identity: crate::platform::file_transaction::Identity,
+    write_invalid: bool,
+    maintenance_warning: Option<String>,
 }
 
 impl VaultSession {
@@ -65,12 +72,12 @@ impl VaultSession {
         let kdf_params = KdfConfig::default().validate()?;
         let salt = random_array::<SALT_LEN>()?;
         let wrap_nonce = random_array::<NONCE_LEN>()?;
-        let vault_key = random_array::<32>()?;
+        let vault_key = Zeroizing::new(random_array::<32>()?);
         let vault_id = Uuid::new_v4();
 
-        let mut kek = derive_kek(master_password, &salt, kdf_params)?;
+        let mut kek = Zeroizing::new(derive_kek(master_password, &salt, kdf_params)?);
         let wrap_aad = keywrap_aad(vault_id, kdf_params, &salt);
-        let wrapped_vault_key = seal(&kek, &wrap_nonce, &wrap_aad, &vault_key)?;
+        let wrapped_vault_key = seal(&kek, &wrap_nonce, &wrap_aad, &vault_key[..])?;
         kek.zeroize();
 
         let header = PublicHeader {
@@ -85,7 +92,7 @@ impl VaultSession {
             wrapped_vault_key: b64(&wrapped_vault_key),
         };
 
-        let keys = VaultKeys::from_vault_key(vault_key)?;
+        let keys = VaultKeys::from_vault_key(*vault_key)?;
         let body = VaultBody::default();
         let bytes = encode_file(&header, &body, &keys)?;
         verify_encoded_bytes(&bytes, &header, &body, &keys)?;
@@ -96,7 +103,7 @@ impl VaultSession {
         #[cfg(test)]
         tests::run_after_publish_hook();
 
-        let persisted = read_bounded(&path)?;
+        let (persisted, source_identity) = bounded::read_identified(&path, MAX_VAULT_BYTES)?;
         // Another writer may have replaced the published path. Verification
         // failure must not delete a destination whose ownership is unproven.
         verify_encoded_bytes(&persisted, &header, &body, &keys)?;
@@ -104,7 +111,10 @@ impl VaultSession {
         Ok(Self {
             instance_id: Uuid::new_v4(),
             import_epoch: Uuid::new_v4(),
-            path,
+            source_identity,
+            path: recovery::normalized_destination_path(&path)?,
+            write_invalid: false,
+            maintenance_warning: None,
             header,
             body,
             keys,
@@ -114,17 +124,26 @@ impl VaultSession {
 
     pub fn open(path: impl Into<PathBuf>, master_password: &str) -> Result<Self> {
         let path = path.into();
-        let bytes = read_bounded(&path)?;
-        let file: VaultFile = serde_json::from_slice(&bytes)?;
+        let (bytes, source_identity) = bounded::read_identified(&path, MAX_VAULT_BYTES)?;
+        Self::from_captured(path, master_password, &bytes, source_identity)
+    }
+
+    fn from_captured(
+        path: PathBuf,
+        master_password: &str,
+        bytes: &[u8],
+        source_identity: crate::platform::file_transaction::Identity,
+    ) -> Result<Self> {
+        let file: VaultFile = serde_json::from_slice(bytes)?;
         validate_header(&file.header)?;
 
         let salt = decode_array::<SALT_LEN>(&file.header.kdf_salt)?;
         let wrap_nonce = decode_array::<NONCE_LEN>(&file.header.wrap_nonce)?;
         let wrapped_key = STANDARD_NO_PAD.decode(&file.header.wrapped_vault_key)?;
 
-        let mut kek = derive_kek(master_password, &salt, file.header.kdf_params)?;
+        let mut kek = Zeroizing::new(derive_kek(master_password, &salt, file.header.kdf_params)?);
         let wrap_aad = keywrap_aad(file.header.vault_id, file.header.kdf_params, &salt);
-        let mut unwrapped = open(&kek, &wrap_nonce, &wrap_aad, &wrapped_key)?;
+        let mut unwrapped = Zeroizing::new(open(&kek, &wrap_nonce, &wrap_aad, &wrapped_key)?);
         kek.zeroize();
 
         if unwrapped.len() != 32 {
@@ -134,11 +153,11 @@ impl VaultSession {
             ));
         }
 
-        let mut vault_key = [0u8; 32];
+        let mut vault_key = Zeroizing::new([0u8; 32]);
         vault_key.copy_from_slice(&unwrapped);
         unwrapped.zeroize();
 
-        let keys = VaultKeys::from_vault_key(vault_key)?;
+        let keys = VaultKeys::from_vault_key(*vault_key)?;
         let body = decode_body(&file, &keys)?;
         if body.schema_version != BODY_SCHEMA_VERSION {
             return Err(AppError::UnsupportedSchema(body.schema_version));
@@ -147,11 +166,14 @@ impl VaultSession {
         Ok(Self {
             instance_id: Uuid::new_v4(),
             import_epoch: Uuid::new_v4(),
-            path,
+            source_identity,
+            path: recovery::normalized_destination_path(&path)?,
+            write_invalid: false,
+            maintenance_warning: None,
             header: file.header,
             body,
             keys,
-            source_hash: security::sha256(&bytes),
+            source_hash: security::sha256(bytes),
         })
     }
 
@@ -299,48 +321,149 @@ impl VaultSession {
     }
 
     pub fn save(&mut self) -> Result<()> {
-        let current = read_bounded(&self.path)?;
-        if security::sha256(&current) != self.source_hash {
+        self.ensure_maintenance_ready()?;
+        if self.write_invalid {
             return Err(AppError::ExternalChange);
         }
-
         let mut next_header = self.header.clone();
         next_header.revision = next_header
             .revision
             .checked_add(1)
             .ok_or(AppError::InvalidVault("revision overflow"))?;
         let bytes = encode_file(&next_header, &self.body, &self.keys)?;
-        verify_encoded_bytes(&bytes, &next_header, &self.body, &self.keys)?;
-
-        let temp = temp_path_for(&self.path);
-        write_temp_file(&temp, &bytes)?;
-        let backup = backup_path_for(&self.path);
-        platform::atomic_replace(&self.path, &temp, Some(&backup))?;
-
-        let persisted = match read_bounded(&self.path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                rollback_after_failed_save(&self.path, &backup)?;
-                return Err(error);
+        let result = transaction::commit(
+            transaction::SourceExpectation {
+                target: &self.path,
+                hash: self.source_hash,
+                identity: self.source_identity,
+            },
+            &bytes,
+            |old| self.verify_baseline(old),
+            |new| verify_encoded_bytes(new, &next_header, &self.body, &self.keys),
+        );
+        match result {
+            Ok(receipt) => {
+                self.header = next_header;
+                self.source_hash = receipt.hash;
+                self.source_identity = receipt.identity;
+                self.maintenance_warning = receipt.warning;
+                Ok(())
             }
-        };
-
-        if let Err(error) = verify_encoded_bytes(&persisted, &next_header, &self.body, &self.keys) {
-            rollback_after_failed_save(&self.path, &backup)?;
-            return Err(error);
+            Err(error) => {
+                if error.invalidates_session() {
+                    self.write_invalid = true;
+                    self.consume_import_preview();
+                }
+                Err(error)
+            }
         }
+    }
 
-        self.header = next_header;
-        self.source_hash = security::sha256(&persisted);
+    fn ensure_maintenance_ready(&self) -> Result<()> {
+        if let Some(warning) = &self.maintenance_warning {
+            return Err(transaction::maintenance_failure(
+                transaction::SourceExpectation {
+                    target: &self.path,
+                    hash: self.source_hash,
+                    identity: self.source_identity,
+                },
+                warning,
+            ));
+        }
         Ok(())
     }
 
-    pub fn verify_current_file(&self) -> Result<()> {
-        let bytes = read_bounded(&self.path)?;
-        if security::sha256(&bytes) != self.source_hash {
+    pub fn maintenance_warning(&self) -> Option<&str> {
+        self.maintenance_warning.as_deref()
+    }
+
+    fn verify_baseline(&self, bytes: &[u8]) -> Result<()> {
+        if security::sha256(bytes) != self.source_hash {
             return Err(AppError::ExternalChange);
         }
-        verify_encoded_bytes(&bytes, &self.header, &self.body, &self.keys)
+        let file: VaultFile = serde_json::from_slice(bytes)?;
+        validate_header(&file.header)?;
+        if file.header.vault_id != self.header.vault_id
+            || file.header.revision != self.header.revision
+        {
+            return Err(AppError::ExternalChange);
+        }
+        let body = decode_body(&file, &self.keys)?;
+        if body.schema_version != BODY_SCHEMA_VERSION {
+            return Err(AppError::UnsupportedSchema(body.schema_version));
+        }
+        Ok(())
+    }
+
+    /// Explicitly confirmed overwrite is bound to this active destination session.
+    /// The returned session was authenticated from captured bytes and verified by
+    /// the transaction; callers must not reopen the pathname to adopt it.
+    pub fn restore_over_current(&mut self, source: &Path, master_password: &str) -> Result<Self> {
+        self.ensure_maintenance_ready()?;
+        if self.write_invalid {
+            return Err(AppError::ExternalChange);
+        }
+        if same_path(source, &self.path) {
+            return Err(AppError::Input("恢复源与目标不能是同一个文件".into()));
+        }
+        let (bytes, source_identity) = bounded::read_identified(source, MAX_VAULT_BYTES)?;
+        let mut candidate = Self::from_captured(
+            source.to_path_buf(),
+            master_password,
+            &bytes,
+            source_identity,
+        )?;
+        let result = transaction::commit(
+            transaction::SourceExpectation {
+                target: &self.path,
+                hash: self.source_hash,
+                identity: self.source_identity,
+            },
+            &bytes,
+            |old| self.verify_baseline(old),
+            |new| verify_encoded_bytes(new, &candidate.header, &candidate.body, &candidate.keys),
+        );
+        match result {
+            Ok(receipt) => {
+                candidate.path = self.path.clone();
+                candidate.source_hash = receipt.hash;
+                candidate.source_identity = receipt.identity;
+                candidate.maintenance_warning = receipt.warning;
+                self.write_invalid = true;
+                self.consume_import_preview();
+                Ok(candidate)
+            }
+            Err(error) => {
+                if error.invalidates_session() {
+                    self.write_invalid = true;
+                    self.consume_import_preview();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub fn verify_current_file(&self) -> Result<()> {
+        if self.write_invalid {
+            return Err(AppError::ExternalChange);
+        }
+        let verification = (|| {
+            let (bytes, identity) = bounded::read_identified(&self.path, MAX_VAULT_BYTES)?;
+            if identity != self.source_identity || security::sha256(&bytes) != self.source_hash {
+                return Err(AppError::ExternalChange);
+            }
+            verify_encoded_bytes(&bytes, &self.header, &self.body, &self.keys)
+        })();
+        verification.map_err(|error| {
+            transaction::current_source_failure(
+                transaction::SourceExpectation {
+                    target: &self.path,
+                    hash: self.source_hash,
+                    identity: self.source_identity,
+                },
+                error,
+            )
+        })
     }
 
     pub fn export_encrypted_backup(&self, destination: &Path) -> Result<()> {
@@ -386,71 +509,31 @@ impl VaultSession {
             return Err(AppError::AlreadyExists);
         }
 
-        let verified = Self::open(source.to_path_buf(), master_password)?;
-        let expected_id = verified.vault_id();
-        let expected_revision = verified.revision();
-        let expected_hash = verified.source_hash;
-        let bytes = read_bounded(source)?;
-        if security::sha256(&bytes) != expected_hash {
-            return Err(AppError::ExternalChange);
+        if overwrite {
+            return Err(AppError::Input(
+                "覆盖恢复需要当前目标会话；请使用已确认的 restore_over_current，或恢复到新文件"
+                    .into(),
+            ));
         }
-        drop(verified);
-
-        if !overwrite {
-            let temp = tempfile::TempPath::from_path(temp_path_for(destination));
-            write_temp_file(&temp, &bytes)?;
-            platform::atomic_create_new(destination, temp)?;
-            #[cfg(test)]
-            tests::run_after_publish_hook();
-
-            return match Self::open(destination.to_path_buf(), master_password) {
-                Ok(restored)
-                    if restored.vault_id() == expected_id
-                        && restored.revision() == expected_revision
-                        && restored.source_hash == expected_hash =>
-                {
-                    Ok(())
-                }
-                Ok(_) | Err(_) => {
-                    // Another writer may own the published path now. Never
-                    // remove or replace a destination of unproven ownership.
-                    Err(AppError::InvalidVault(
-                        "restored encrypted backup failed verification",
-                    ))
-                }
-            };
-        }
-
-        let temp = temp_path_for(destination);
-        write_temp_file(&temp, &bytes)?;
-
-        let backup = backup_path_for(destination);
-        let had_destination = destination.exists();
-        platform::atomic_replace(
-            destination,
-            &temp,
-            had_destination.then_some(backup.as_path()),
+        let (bytes, source_identity) = bounded::read_identified(source, MAX_VAULT_BYTES)?;
+        let verified = Self::from_captured(
+            source.to_path_buf(),
+            master_password,
+            &bytes,
+            source_identity,
         )?;
-
-        let restored = Self::open(destination.to_path_buf(), master_password);
-        match restored {
-            Ok(restored)
-                if restored.vault_id() == expected_id
-                    && restored.revision() == expected_revision =>
-            {
-                Ok(())
-            }
-            Ok(_) | Err(_) => {
-                if had_destination && backup.exists() {
-                    platform::atomic_replace(destination, &backup, None)?;
-                } else {
-                    let _ = fs::remove_file(destination);
-                }
-                Err(AppError::InvalidVault(
-                    "restored encrypted backup failed verification",
-                ))
-            }
+        let temp = tempfile::TempPath::from_path(temp_path_for(destination));
+        write_temp_file(&temp, &bytes)?;
+        platform::atomic_create_new(destination, temp)?;
+        #[cfg(test)]
+        tests::run_after_publish_hook();
+        let copied = read_bounded(destination)?;
+        if copied != bytes {
+            return Err(AppError::InvalidVault(
+                "restored encrypted backup failed verification",
+            ));
         }
+        verify_encoded_bytes(&copied, &verified.header, &verified.body, &verified.keys)
     }
 
     pub(crate) fn body(&self) -> &VaultBody {
@@ -472,7 +555,7 @@ impl VaultSession {
     fn seal_secret(&self, id: Uuid, secret: &SecretPayload) -> Result<SecretEnvelope> {
         let nonce = random_array::<NONCE_LEN>()?;
         let aad = entry_aad(self.header.vault_id, id);
-        let mut plaintext = serde_json::to_vec(secret)?;
+        let mut plaintext = Zeroizing::new(serde_json::to_vec(secret)?);
         let ciphertext = seal(&self.keys.secret_key, &nonce, &aad, &plaintext)?;
         plaintext.zeroize();
 
@@ -481,12 +564,12 @@ impl VaultSession {
 
     fn open_secret(&self, entry: &EntryRecord) -> Result<SecretPayload> {
         let aad = entry_aad(self.header.vault_id, entry.id);
-        let mut plaintext = open(
+        let mut plaintext = Zeroizing::new(open(
             &self.keys.secret_key,
             &entry.secret.nonce,
             &aad,
             &entry.secret.ciphertext,
-        )?;
+        )?);
         let secret = serde_json::from_slice(&plaintext)?;
         plaintext.zeroize();
         Ok(secret)
@@ -549,7 +632,7 @@ fn entry_aad(vault_id: Uuid, entry_id: Uuid) -> Vec<u8> {
 
 fn encode_file(header: &PublicHeader, body: &VaultBody, keys: &VaultKeys) -> Result<Vec<u8>> {
     let nonce = random_array::<NONCE_LEN>()?;
-    let mut plaintext = serde_json::to_vec(body)?;
+    let mut plaintext = Zeroizing::new(serde_json::to_vec(body)?);
     let ciphertext = seal(&keys.vault_key, &nonce, &body_aad(header), &plaintext)?;
     plaintext.zeroize();
 
@@ -564,12 +647,12 @@ fn encode_file(header: &PublicHeader, body: &VaultBody, keys: &VaultKeys) -> Res
 fn decode_body(file: &VaultFile, keys: &VaultKeys) -> Result<VaultBody> {
     let nonce = decode_array::<NONCE_LEN>(&file.body_nonce)?;
     let ciphertext = STANDARD_NO_PAD.decode(&file.body_ciphertext)?;
-    let mut plaintext = open(
+    let mut plaintext = Zeroizing::new(open(
         &keys.vault_key,
         &nonce,
         &body_aad(&file.header),
         &ciphertext,
-    )?;
+    )?);
     let body = serde_json::from_slice(&plaintext)?;
     plaintext.zeroize();
     Ok(body)
@@ -604,16 +687,6 @@ fn verify_encoded_bytes(
     Ok(())
 }
 
-fn rollback_after_failed_save(target: &Path, backup: &Path) -> Result<()> {
-    if !backup.exists() {
-        return Err(AppError::InvalidVault(
-            "post-save verification failed and backup is unavailable",
-        ));
-    }
-
-    platform::atomic_replace(target, backup, None)
-}
-
 fn b64(bytes: &[u8]) -> String {
     STANDARD_NO_PAD.encode(bytes)
 }
@@ -629,32 +702,14 @@ fn decode_array<const N: usize>(value: &str) -> Result<[u8; N]> {
 }
 
 fn read_bounded(path: &Path) -> Result<Vec<u8>> {
-    let mut file = File::open(path).map_err(|error| AppError::io(path.to_path_buf(), error))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| AppError::io(path.to_path_buf(), error))?;
-    if metadata.len() > MAX_VAULT_BYTES {
-        return Err(AppError::InvalidVault("vault exceeds size limit"));
-    }
-
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)
-        .map_err(|error| AppError::io(path.to_path_buf(), error))?;
-    Ok(bytes)
+    bounded::read(path, MAX_VAULT_BYTES)
 }
 
 fn write_temp_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent).map_err(|error| AppError::io(parent.to_path_buf(), error))?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
     }
-
-    let mut file = File::create(path).map_err(|error| AppError::io(path.to_path_buf(), error))?;
-    file.write_all(bytes)
-        .map_err(|error| AppError::io(path.to_path_buf(), error))?;
-    file.sync_all()
-        .map_err(|error| AppError::io(path.to_path_buf(), error))?;
+    bounded::write_new(path, bytes)?;
     #[cfg(test)]
     tests::run_before_publish_hook();
     Ok(())
@@ -666,14 +721,6 @@ fn temp_path_for(path: &Path) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("vault.pmvault");
     path.with_file_name(format!(".{name}.tmp-{}", Uuid::new_v4()))
-}
-
-fn backup_path_for(path: &Path) -> PathBuf {
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("vault.pmvault");
-    path.with_file_name(format!("{name}.bak"))
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -730,9 +777,71 @@ mod tests {
                 assert!(destination.exists());
                 let competing = destination.with_file_name("competing-file.tmp");
                 fs::write(&competing, b"another writer's replacement").unwrap();
-                platform::atomic_replace(&destination, &competing, None).unwrap();
+                fs::remove_file(&destination).unwrap();
+                fs::rename(&competing, &destination).unwrap();
             }));
         });
+    }
+
+    fn contains_bytes(root: &Path, expected: &[u8]) -> bool {
+        fs::read_dir(root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                if entry.file_type().unwrap().is_dir() {
+                    contains_bytes(&entry.path(), expected)
+                } else {
+                    fs::read(entry.path()).is_ok_and(|bytes| bytes == expected)
+                }
+            })
+    }
+
+    #[test]
+    fn transaction_success_keeps_independent_previous_encrypted_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.pmvault");
+        let mut vault = VaultSession::create(&path, "synthetic-only").unwrap();
+        let before = fs::read(&path).unwrap();
+        vault
+            .add_entry(EntryDraft::login("New", "", "", "synthetic"))
+            .unwrap();
+        vault.save().unwrap();
+        assert_ne!(fs::read(&path).unwrap(), before);
+        assert!(
+            contains_bytes(dir.path(), &before),
+            "previous encrypted bytes were lost"
+        );
+    }
+
+    #[test]
+    fn transaction_final_recheck_preserves_prepublication_competitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.pmvault");
+        let mut vault = VaultSession::create(&path, "synthetic-only").unwrap();
+        let target = path.clone();
+        BEFORE_PUBLISH.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                fs::write(target, b"prepublication competing file").unwrap();
+            }))
+        });
+        assert!(vault.save().is_err());
+        assert_eq!(fs::read(path).unwrap(), b"prepublication competing file");
+    }
+
+    #[test]
+    fn transaction_postpublication_conflict_retains_evidence_without_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.pmvault");
+        let mut vault = VaultSession::create(&path, "synthetic-only").unwrap();
+        let before = fs::read(&path).unwrap();
+        replace_destination_after_publish(path.clone());
+        let error = vault.save().unwrap_err();
+        assert!(
+            error.to_string().contains("recovery"),
+            "must explicitly require recovery: {error}"
+        );
+        assert_eq!(fs::read(path).unwrap(), b"another writer's replacement");
+        assert!(contains_bytes(dir.path(), &before));
     }
 
     #[test]
@@ -931,7 +1040,8 @@ mod tests {
         AFTER_PUBLISH.with(|slot| {
             *slot.borrow_mut() = Some(Box::new(move || {
                 assert!(competing_destination.exists());
-                platform::atomic_replace(&competing_destination, &competing, None).unwrap();
+                fs::remove_file(&competing_destination).unwrap();
+                fs::rename(&competing, &competing_destination).unwrap();
             }));
         });
 
@@ -1027,3 +1137,6 @@ mod tests {
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 }
+
+#[cfg(test)]
+mod transaction_tests;

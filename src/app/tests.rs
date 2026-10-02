@@ -1177,3 +1177,582 @@ fn gui_import_source_duplicates_and_independent_conflict_choices() {
         assert!(app.revealed.is_none());
     }
 }
+
+#[test]
+fn external_mutation_conflict_locks_and_revokes_ui_context() {
+    let (_dir, mut app) = fixture(1);
+    let id = app.session.as_ref().unwrap().entries()[0].id;
+    let path = app.session.as_ref().unwrap().path().to_path_buf();
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.push(b' ');
+    std::fs::write(&path, &bytes).unwrap();
+    let _ = app.update(Message::CardAction(id, CardAction::Favorite));
+    assert!(
+        app.session.is_none(),
+        "external conflict must revoke the stale session"
+    );
+    assert!(app.revealed.is_none());
+    assert!(app.clipboard_session.is_none());
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+}
+
+#[test]
+fn recovery_inspection_errors_are_visible_and_block_open() {
+    let (dir, mut app) = fixture(0);
+    app.lock_with_status("synthetic");
+    // A directory full of unrelated entries exceeds the bounded inspection
+    // budget. An incomplete scan must never quietly allow modification.
+    for index in 0..4100 {
+        std::fs::write(dir.path().join(format!("unrelated-{index}")), b"").unwrap();
+    }
+    assert!(
+        app.check_startup_recovery(),
+        "incomplete recovery inspection was silently ignored"
+    );
+    assert!(app.recovery.is_some());
+    assert!(app.status.contains("检查") || app.status.contains("恢复"));
+}
+
+#[test]
+fn recovery_secrets_and_late_events_are_invalidated_by_lock_and_navigation() {
+    let (_dir, mut app) = fixture(0);
+    app.lock_with_status("synthetic");
+    for transition in [
+        Message::Lock,
+        Message::AuthMode(true),
+        Message::ToggleAuthOptions,
+        Message::PlatformSecurity(SecurityEvent::MonitorFailed),
+    ] {
+        app.open_recovery();
+        let generation = app.recovery.as_ref().unwrap().generation;
+        let _ = app.update(Message::RecoveryPasswordChanged(
+            generation,
+            "synthetic-secret".into(),
+        ));
+        let _ = app.update(transition);
+        assert!(
+            app.recovery.is_none(),
+            "navigation left recovery secrets live"
+        );
+        let _ = app.update(Message::RecoveryPasswordChanged(
+            generation,
+            "stale-secret".into(),
+        ));
+        let _ = app.update(Message::RestoreRecoveryCopy(generation));
+        assert!(app.recovery.is_none());
+        assert!(app.session.is_none());
+    }
+}
+
+#[test]
+fn recovery_selected_copy_wrong_password_corruption_collision_and_success() {
+    let (dir, mut app) = fixture(1);
+    let source = app.session.as_ref().unwrap().path().to_path_buf();
+    let original = std::fs::read(&source).unwrap();
+    let destination = dir.path().join("restored-new.pmvault");
+    app.lock_with_status("synthetic");
+    app.security_monitor_ready = true;
+    app.open_recovery();
+    let generation = app.recovery.as_ref().unwrap().generation;
+    let _ = app.update(Message::RecoverySourceChanged(
+        generation,
+        source.display().to_string(),
+    ));
+    let _ = app.update(Message::RecoveryDestinationChanged(
+        generation,
+        destination.display().to_string(),
+    ));
+    let _ = app.update(Message::RecoveryPasswordChanged(
+        generation,
+        "wrong-password".into(),
+    ));
+    let _ = app.update(Message::RestoreRecoveryCopy(generation));
+    assert!(!destination.exists());
+    assert!(app.recovery.as_ref().unwrap().password.is_empty());
+    let corrupt = dir.path().join("corrupt.pmvault");
+    std::fs::write(&corrupt, b"corrupt synthetic").unwrap();
+    let _ = app.update(Message::RecoverySourceChanged(
+        generation,
+        corrupt.display().to_string(),
+    ));
+    let _ = app.update(Message::RecoveryPasswordChanged(
+        generation,
+        "synthetic-only".into(),
+    ));
+    let _ = app.update(Message::RestoreRecoveryCopy(generation));
+    assert!(!destination.exists());
+    let _ = app.update(Message::RecoverySourceChanged(
+        generation,
+        source.display().to_string(),
+    ));
+    std::fs::write(&destination, b"another file").unwrap();
+    let _ = app.update(Message::RecoveryPasswordChanged(
+        generation,
+        "gui-synthetic-master-only".into(),
+    ));
+    let _ = app.update(Message::RestoreRecoveryCopy(generation));
+    assert_eq!(std::fs::read(&destination).unwrap(), b"another file");
+    let new_destination = dir.path().join("actually-new.pmvault");
+    let _ = app.update(Message::RecoveryDestinationChanged(
+        generation,
+        new_destination.display().to_string(),
+    ));
+    let _ = app.update(Message::RecoveryPasswordChanged(
+        generation,
+        "gui-synthetic-master-only".into(),
+    ));
+    let _ = app.update(Message::RestoreRecoveryCopy(generation));
+    assert!(app.recovery.is_none());
+    assert!(app.session.is_none());
+    assert_eq!(std::fs::read(&new_destination).unwrap(), original);
+    assert_eq!(std::fs::read(&source).unwrap(), original);
+    let _ = app.update(Message::RestoreRecoveryCopy(generation));
+    assert_eq!(std::fs::read(new_destination).unwrap(), original);
+}
+#[test]
+fn mutation_and_import_uncertainty_lock_but_rejected_mutation_keeps_session() {
+    use crate::storage::transaction::{Point, set_hook};
+    let (_dir, mut app) = fixture(1);
+    let id = app.session.as_ref().unwrap().entries()[0].id;
+    set_hook(Point::BeforePublish, || {
+        Err(AppError::Platform("synthetic staging rejection".into()))
+    });
+    let _ = app.update(Message::CardAction(id, CardAction::Favorite));
+    assert!(app.session.is_some());
+    assert!(!app.session.as_ref().unwrap().entry(id).unwrap().favorite);
+    set_hook(Point::AfterPublish, || {
+        Err(AppError::Platform("synthetic uncertain sync".into()))
+    });
+    let _ = app.update(Message::CardAction(id, CardAction::Favorite));
+    assert!(app.session.is_none());
+    assert!(app.recovery_notice.is_some());
+    let (dir, mut app) = fixture(0);
+    let csv = dir.path().join("import.csv");
+    std::fs::write(
+        &csv,
+        "name,url,username,password,note\nSynthetic,https://example.test,u,p,\n",
+    )
+    .unwrap();
+    let _ = app.update(Message::OpenImport);
+    let _ = app.update(Message::ImportPathChanged(csv.display().to_string()));
+    let _ = app.update(Message::AnalyzeImport);
+    let id = match &app.panel {
+        Panel::Import(s) => s.preview.as_ref().unwrap().id(),
+        _ => panic!(),
+    };
+    set_hook(Point::AfterPublish, || {
+        Err(AppError::Platform("synthetic uncertain import".into()))
+    });
+    let _ = app.update(Message::ApplyImport(id));
+    assert!(app.session.is_none());
+    assert!(matches!(app.panel, Panel::Vault));
+    assert!(app.recovery.is_some());
+    let _ = app.update(Message::ApplyImport(id));
+    assert!(app.session.is_none());
+}
+#[test]
+fn recovery_picker_late_results_and_pending_restore_are_rejected() {
+    let (_dir, mut app) = fixture(0);
+    app.lock_with_status("synthetic");
+    app.open_recovery();
+    let generation = app.recovery.as_ref().unwrap().generation;
+    let _ = app.begin_picker(picker::Purpose::RecoverySource);
+    let _ = app.update(Message::RestoreRecoveryCopy(generation));
+    assert!(app.recovery.as_ref().unwrap().source.is_empty());
+    app.dismiss_recovery();
+    app.open_recovery();
+    // Native picker-specific late-result assertions also live in picker tests.
+    assert_ne!(app.recovery.as_ref().unwrap().generation, generation);
+    let _ = app.update(Message::RecoverySourceChanged(
+        generation,
+        "stale.pmvault".into(),
+    ));
+    assert!(app.recovery.as_ref().unwrap().source.is_empty());
+}
+#[cfg(windows)]
+#[test]
+fn recovery_does_not_derive_or_create_before_windows_monitor_ready() {
+    let (dir, mut app) = fixture(0);
+    let source = app.session.as_ref().unwrap().path().to_path_buf();
+    app.lock_with_status("synthetic");
+    app.open_recovery();
+    app.security_monitor_ready = false;
+    let state = app.recovery.as_mut().unwrap();
+    state.source = source.display().to_string();
+    state.destination = dir
+        .path()
+        .join("must-not-exist.pmvault")
+        .display()
+        .to_string();
+    *state.password = "gui-synthetic-master-only".into();
+    let generation = state.generation;
+    let _ = app.update(Message::RestoreRecoveryCopy(generation));
+    assert!(!dir.path().join("must-not-exist.pmvault").exists());
+    assert!(app.recovery.as_ref().unwrap().password.is_empty());
+    assert!(app.status.contains("监控"));
+}
+
+#[test]
+#[ignore = "headless GUI regression"]
+fn gui_locked_recovery_interactions_at_three_sizes() {
+    for size in SIZES {
+        let (dir, mut app) = fixture(1);
+        let source = app.session.as_ref().unwrap().path().to_path_buf();
+        app.lock_with_status("synthetic recovery review");
+        app.security_monitor_ready = true;
+        let mut ui = simulator(&app, size);
+        ui.click("检查恢复副本").unwrap();
+        let messages = ui.into_messages().collect();
+        apply_messages(&mut app, messages);
+        assert!(app.recovery.is_some());
+        let mut ui = simulator(&app, size);
+        ui.click("选择此副本").unwrap();
+        let messages = ui.into_messages().collect();
+        apply_messages(&mut app, messages);
+        assert!(!app.recovery.as_ref().unwrap().source.is_empty());
+        let mut ui = simulator(&app, size);
+        ui.click("选择新文件位置").unwrap();
+        let messages = ui.into_messages().collect();
+        apply_messages(&mut app, messages);
+        assert!(app.picker_pending.is_some());
+        // The native OS dialog is not created by iced_test. Cancel its slot and
+        // continue using real text-input/button events in the locked surface.
+        app.picker_pending = None;
+        let destination = dir.path().join("gui-recovered.pmvault");
+        let mut ui = simulator(&app, size);
+        ui.click(selector::id("recovery-destination")).unwrap();
+        ui.typewrite(destination.to_str().unwrap());
+        let messages = ui.into_messages().collect();
+        apply_messages(&mut app, messages);
+        let mut ui = simulator(&app, size);
+        ui.click(selector::id("recovery-password")).unwrap();
+        ui.typewrite("wrong-password");
+        let messages = ui.into_messages().collect();
+        apply_messages(&mut app, messages);
+        capture(&app, "locked-recovery-selected", size);
+        let mut ui = simulator(&app, size);
+        ui.click("验证并恢复到新文件").unwrap();
+        let messages = ui.into_messages().collect();
+        apply_messages(&mut app, messages);
+        assert!(!destination.exists());
+        assert!(app.recovery.as_ref().unwrap().password.is_empty());
+        capture(&app, "locked-recovery-wrong-password", size);
+        let mut ui = simulator(&app, size);
+        ui.click(selector::id("recovery-password")).unwrap();
+        ui.typewrite("gui-synthetic-master-only");
+        let messages = ui.into_messages().collect();
+        apply_messages(&mut app, messages);
+        let mut ui = simulator(&app, size);
+        ui.click("验证并恢复到新文件").unwrap();
+        let messages = ui.into_messages().collect();
+        apply_messages(&mut app, messages);
+        assert!(destination.exists());
+        assert!(app.recovery.is_none());
+        assert!(app.session.is_none());
+        assert!(source.exists());
+    }
+}
+
+#[test]
+fn confirmed_restore_adopts_verified_session_or_locks_on_uncertainty() {
+    use crate::storage::transaction::{Point, set_hook};
+    for point in [Some(Point::BeforePublish), Some(Point::AfterPublish), None] {
+        let (dir, mut app) = fixture(1);
+        let old_id = app.session.as_ref().unwrap().vault_id();
+        let source = dir.path().join("confirmed-source.pmvault");
+        let source_session = VaultSession::create(&source, "restore-synthetic-only").unwrap();
+        let expected_id = source_session.vault_id();
+        let source_bytes = std::fs::read(&source).unwrap();
+        let _ = app.update(Message::OpenSettings);
+        let _ = app.update(Message::RestorePathChanged(source.display().to_string()));
+        let _ = app.update(Message::RestorePasswordChanged(
+            "restore-synthetic-only".into(),
+        ));
+        let _ = app.update(Message::ConfirmRestoreChanged(true));
+        if let Some(point) = point {
+            set_hook(point, || {
+                Err(AppError::Platform("synthetic restore boundary".into()))
+            });
+        }
+        let _ = app.update(Message::RestoreBackup);
+        match point {
+            Some(Point::BeforePublish) => {
+                assert_eq!(app.session.as_ref().unwrap().vault_id(), old_id);
+                assert!(matches!(&app.panel,Panel::Settings(s) if s.restore_password.is_empty()));
+            }
+            Some(_) => {
+                assert!(app.session.is_none());
+                assert!(app.recovery.is_some());
+                assert!(matches!(app.panel, Panel::Vault));
+            }
+            None => {
+                assert_eq!(app.session.as_ref().unwrap().vault_id(), expected_id);
+                assert!(matches!(app.panel, Panel::Vault));
+                app.session.as_ref().unwrap().verify_current_file().unwrap();
+            }
+        }
+        assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+        let _ = app.update(Message::RestoreBackup);
+        assert!(point != Some(Point::AfterPublish) || app.session.is_none());
+    }
+}
+
+#[test]
+fn review_c1_manual_path_edit_does_not_navigate_or_clear_passwords() {
+    for creating in [false, true] {
+        let mut app = App::initial();
+        app.creating = creating;
+        app.auth_options_open = true;
+        app.master_password = "synthetic-input".into();
+        app.confirm_password = "synthetic-confirm".into();
+        for path in [
+            "",
+            "/",
+            ".",
+            "/synthetic-not-yet-existing/",
+            "complete.pmvault",
+        ] {
+            let _ = app.update(Message::VaultPathChanged(path.into()));
+            assert!(
+                app.recovery.is_none(),
+                "manual input was interpreted as open"
+            );
+            assert_eq!(app.vault_path, path);
+            assert_eq!(app.master_password, "synthetic-input");
+            assert_eq!(app.confirm_password, "synthetic-confirm");
+        }
+    }
+}
+#[test]
+fn review_c2_recovery_keeps_clipboard_warning_after_uncertainty() {
+    let (_dir, mut app) = fixture(1);
+    let id = app.session.as_ref().unwrap().entries()[0].id;
+    let _ = app.update(Message::PlatformSecurity(
+        SecurityEvent::ClipboardCleanupFailed,
+    ));
+    crate::storage::transaction::set_hook(crate::storage::transaction::Point::AfterPublish, || {
+        Err(AppError::Platform("synthetic uncertainty".into()))
+    });
+    let _ = app.update(Message::CardAction(id, CardAction::Favorite));
+    assert!(app.session.is_none());
+    assert!(app.recovery.is_some());
+    app.status = "a later error must not hide the warning".into();
+    let mut ui = simulator(&app, (1280.0, 800.0));
+    ui.click("我已手动处理剪贴板")
+        .expect("persistent clipboard action disappeared in recovery");
+}
+#[test]
+fn review_c3_save_verification_missing_or_unsupported_source_locks() {
+    for mode in ["missing", "directory", "changed"] {
+        let (_dir, mut app) = fixture(1);
+        let id = app.session.as_ref().unwrap().entries()[0].id;
+        app.selected = Some(id);
+        app.context_open = true;
+        app.toggle_reveal();
+        assert!(app.revealed.is_some());
+        let path = app.session.as_ref().unwrap().path().to_path_buf();
+        if mode == "changed" {
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes.push(b' ');
+            std::fs::write(&path, bytes).unwrap();
+        } else {
+            std::fs::remove_file(&path).unwrap();
+            if mode == "directory" {
+                std::fs::create_dir(&path).unwrap();
+            }
+        }
+        let error = app
+            .session
+            .as_ref()
+            .unwrap()
+            .verify_current_file()
+            .unwrap_err();
+        assert!(
+            error.invalidates_session(),
+            "missing/type source failure was not invalidating"
+        );
+        let _ = app.update(Message::Save);
+        assert!(app.session.is_none());
+        assert!(app.revealed.is_none());
+        assert!(app.clipboard_session.is_none());
+        assert!(matches!(app.panel, Panel::Vault));
+        assert!(app.recovery.is_some());
+        let expected = match mode {
+            "missing" => crate::storage::recovery::CurrentObservation::Missing,
+            "directory" => crate::storage::recovery::CurrentObservation::Unreadable,
+            _ => crate::storage::recovery::CurrentObservation::Other,
+        };
+        assert_eq!(app.recovery_notice.as_ref().unwrap().current, expected);
+    }
+}
+
+fn scroll_to_bottom(ui: &mut Simulator<'_, Message>, id: &str) {
+    let bounds = ui.find(selector::id(id.to_owned())).unwrap().bounds();
+    ui.point_at(bounds.center());
+    ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+        delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -100.0 },
+    })]);
+}
+#[test]
+#[ignore = "headless GUI regression"]
+fn gui_review_manual_paths_remain_editable_after_picker_fallback() {
+    for size in SIZES {
+        for creating in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(if creating {
+                "created-by-manual-path.pmvault"
+            } else {
+                "opened-by-manual-path.pmvault"
+            });
+            if !creating {
+                VaultSession::create(&path, "manual-synthetic-only").unwrap();
+            }
+            let mut app = App::initial();
+            app.creating = creating;
+            app.security_monitor_ready = true;
+            if !creating {
+                let mut ui = simulator(&app, size);
+                ui.click("更换保险库文件").unwrap();
+                let messages = ui.into_messages().collect();
+                apply_messages(&mut app, messages);
+            }
+            app.master_password = "manual-synthetic-only".into();
+            if creating {
+                app.confirm_password = app.master_password.clone();
+            }
+            let purpose = if creating {
+                picker::Purpose::CreateVault
+            } else {
+                picker::Purpose::OpenVault
+            };
+            let mut ui = simulator(&app, size);
+            ui.click(if creating {
+                "选择新建位置"
+            } else {
+                "选择保险库文件"
+            })
+            .unwrap();
+            let messages = ui.into_messages().collect();
+            apply_messages(&mut app, messages);
+            let pending = app.picker_pending.unwrap();
+            app.finish_picker(
+                pending.id,
+                if creating {
+                    Err("synthetic native provider unavailable".into())
+                } else {
+                    Ok(None)
+                },
+            );
+            let mut ui = simulator(&app, size);
+            ui.click(selector::id(format!("path-{purpose:?}"))).unwrap();
+            command_key(&mut ui, "a");
+            ui.tap_key(keyboard::key::Named::Backspace);
+            let messages = ui.into_messages().collect();
+            apply_messages(&mut app, messages);
+            assert!(app.recovery.is_none());
+            assert!(app.vault_path.is_empty());
+            assert_eq!(app.master_password, "manual-synthetic-only");
+            if creating {
+                assert_eq!(app.confirm_password, "manual-synthetic-only");
+            }
+            let mut ui = simulator(&app, size);
+            ui.click(selector::id(format!("path-{purpose:?}"))).unwrap();
+            ui.typewrite(path.to_str().unwrap());
+            let messages = ui.into_messages().collect();
+            apply_messages(&mut app, messages);
+            assert_eq!(app.vault_path, path.display().to_string());
+            assert!(app.recovery.is_none());
+            capture(
+                &app,
+                if creating {
+                    "review-manual-create-path"
+                } else {
+                    "review-manual-open-path"
+                },
+                size,
+            );
+            let mut ui = simulator(&app, size);
+            scroll_to_bottom(&mut ui, "auth-scroll");
+            ui.click(if creating {
+                "创建并进入"
+            } else {
+                "解 锁"
+            })
+            .unwrap();
+            let messages = ui.into_messages().collect();
+            apply_messages(&mut app, messages);
+            assert!(app.session.is_some(), "{}", app.status);
+        }
+    }
+}
+#[test]
+#[ignore = "headless GUI regression"]
+fn gui_review_recovery_clipboard_warning_survives_password_error() {
+    for size in SIZES {
+        let (dir, mut app) = fixture(1);
+        app.security_monitor_ready = true;
+        let id = app.session.as_ref().unwrap().entries()[0].id;
+        let _ = app.update(Message::PlatformSecurity(
+            SecurityEvent::ClipboardCleanupFailed,
+        ));
+        crate::storage::transaction::set_hook(
+            crate::storage::transaction::Point::AfterPublish,
+            || {
+                Err(AppError::Platform(
+                    "synthetic storage uncertainty; diagnostic deliberately persists".into(),
+                ))
+            },
+        );
+        let _ = app.update(Message::CardAction(id, CardAction::Favorite));
+        assert!(app.recovery.is_some());
+        let mut ui = simulator(&app, size);
+        ui.click("我已手动处理剪贴板").unwrap();
+        let stale: Vec<_> = ui.into_messages().collect();
+        let _ = app.update(Message::PlatformSecurity(
+            SecurityEvent::ClipboardCleanupFailed,
+        ));
+        apply_messages(&mut app, stale);
+        assert!(app.clipboard_cleanup_failed);
+        let mut ui = simulator(&app, size);
+        ui.click("选择此副本").unwrap();
+        let messages = ui.into_messages().collect();
+        apply_messages(&mut app, messages);
+        let destination = dir.path().join("clipboard-warning-new.pmvault");
+        let mut ui = simulator(&app, size);
+        scroll_to_bottom(&mut ui, "recovery-scroll");
+        ui.click(selector::id("recovery-destination")).unwrap();
+        ui.typewrite(destination.to_str().unwrap());
+        let messages = ui.into_messages().collect();
+        apply_messages(&mut app, messages);
+        let mut ui = simulator(&app, size);
+        scroll_to_bottom(&mut ui, "recovery-scroll");
+        ui.click(selector::id("recovery-password")).unwrap();
+        ui.typewrite("wrong-password");
+        let messages = ui.into_messages().collect();
+        apply_messages(&mut app, messages);
+        let mut ui = simulator(&app, size);
+        scroll_to_bottom(&mut ui, "recovery-scroll");
+        ui.click("验证并恢复到新文件").unwrap();
+        let messages = ui.into_messages().collect();
+        apply_messages(&mut app, messages);
+        assert!(!destination.exists());
+        assert!(app.clipboard_cleanup_failed);
+        assert!(app.recovery.as_ref().unwrap().password.is_empty());
+        capture(&app, "review-recovery-clipboard-warning", size);
+        let mut ui = simulator(&app, size);
+        ui.click("我已手动处理剪贴板").unwrap();
+        let messages = ui.into_messages().collect();
+        apply_messages(&mut app, messages);
+        assert!(!app.clipboard_cleanup_failed);
+    }
+}
+
+#[test]
+fn review_c3_matching_source_verification_keeps_live_session() {
+    let (_dir, mut app) = fixture(1);
+    let _ = app.update(Message::Save);
+    assert!(app.session.is_some());
+    assert!(app.clipboard_session.is_some());
+    assert!(app.recovery.is_none());
+    assert!(app.status.contains("校验通过"));
+}

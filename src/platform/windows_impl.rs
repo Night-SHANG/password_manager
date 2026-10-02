@@ -2,7 +2,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -12,10 +11,6 @@ use iced::futures::channel::mpsc::{self, UnboundedSender};
 use iced::futures::sink::SinkExt;
 use iced::{Subscription, stream};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Storage::FileSystem::{
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH,
-    ReplaceFileW,
-};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::RemoteDesktop::{
     NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
@@ -62,57 +57,8 @@ fn clipboard_queue() -> std::sync::MutexGuard<'static, ClipboardQueue> {
         })
 }
 
-fn to_wide(path: &Path) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-
-    path.as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
-}
-
 fn platform_error(context: &str, error: impl std::fmt::Display) -> AppError {
     AppError::Platform(format!("{context}: {error}"))
-}
-
-pub fn atomic_replace(target: &Path, replacement: &Path, backup: Option<&Path>) -> Result<()> {
-    let target_w = to_wide(target);
-    let replacement_w = to_wide(replacement);
-
-    if target.exists() {
-        let backup_w = backup.map(to_wide);
-
-        if let Some(path) = backup
-            && path.exists()
-        {
-            std::fs::remove_file(path).map_err(|error| AppError::io(path.to_path_buf(), error))?;
-        }
-
-        unsafe {
-            ReplaceFileW(
-                PCWSTR(target_w.as_ptr()),
-                PCWSTR(replacement_w.as_ptr()),
-                backup_w
-                    .as_ref()
-                    .map_or(PCWSTR::null(), |wide| PCWSTR(wide.as_ptr())),
-                REPLACEFILE_WRITE_THROUGH,
-                None,
-                None,
-            )
-            .map_err(|error| platform_error("ReplaceFileW", error))?;
-        }
-    } else {
-        unsafe {
-            MoveFileExW(
-                PCWSTR(replacement_w.as_ptr()),
-                PCWSTR(target_w.as_ptr()),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-            .map_err(|error| platform_error("MoveFileExW", error))?;
-        }
-    }
-
-    Ok(())
 }
 
 pub fn set_screen_capture_protection(hwnd_value: isize, enabled: bool) -> Result<()> {

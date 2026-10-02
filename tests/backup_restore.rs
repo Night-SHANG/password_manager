@@ -136,9 +136,24 @@ fn restore_can_atomically_replace_an_existing_vault() {
     source_vault.export_encrypted_backup(&backup).unwrap();
     let expected_id = source_vault.vault_id();
 
-    VaultSession::create(&target, "different-master").unwrap();
-
-    VaultSession::restore_encrypted_backup(&backup, &target, "source-master", true).unwrap();
+    let mut target_session = VaultSession::create(&target, "different-master").unwrap();
+    let old_target = fs::read(&target).unwrap();
+    let adopted = target_session
+        .restore_over_current(&backup, "source-master")
+        .unwrap();
+    assert_eq!(adopted.vault_id(), expected_id);
+    assert!(
+        target_session.save().is_err(),
+        "the previous session cannot write after adoption"
+    );
+    let evidence = password_manager::storage::recovery::inspect(&target).unwrap();
+    assert!(!evidence.maintenance_required);
+    assert!(
+        evidence
+            .artifacts
+            .iter()
+            .any(|copy| fs::read(&copy.path).is_ok_and(|bytes| bytes == old_target))
+    );
 
     let restored = VaultSession::open(&target, "source-master").unwrap();
     assert_eq!(restored.vault_id(), expected_id);

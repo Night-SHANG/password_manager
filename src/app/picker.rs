@@ -10,11 +10,13 @@ pub(super) enum Purpose {
     Backup,
     Restore,
     Csv,
+    RecoverySource,
+    RecoveryDestination,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct Pending {
-    id: u64,
+    pub(super) id: u64,
     purpose: Purpose,
     valid: bool,
 }
@@ -22,6 +24,9 @@ pub(super) struct Pending {
 impl App {
     pub(super) fn picker_allowed(&self, purpose: Purpose) -> bool {
         match purpose {
+            Purpose::RecoverySource | Purpose::RecoveryDestination => {
+                self.session.is_none() && self.recovery.is_some()
+            }
             Purpose::OpenVault => {
                 self.session.is_none() && !self.creating && self.auth_options_open
             }
@@ -51,6 +56,14 @@ impl App {
             valid: true,
         });
         let path = match purpose {
+            Purpose::RecoverySource | Purpose::RecoveryDestination => {
+                let state = self.recovery.as_ref().unwrap();
+                if purpose == Purpose::RecoverySource {
+                    state.source.clone()
+                } else {
+                    state.destination.clone()
+                }
+            }
             Purpose::OpenVault | Purpose::CreateVault => self.vault_path.clone(),
             Purpose::Import => match &self.panel {
                 Panel::Import(s) => s.path.clone(),
@@ -123,6 +136,14 @@ impl App {
             return;
         };
         let message = match pending.purpose {
+            Purpose::RecoverySource => Message::RecoverySourceChanged(
+                self.recovery.as_ref().unwrap().generation,
+                path.into(),
+            ),
+            Purpose::RecoveryDestination => Message::RecoveryDestinationChanged(
+                self.recovery.as_ref().unwrap().generation,
+                path.into(),
+            ),
             Purpose::OpenVault | Purpose::CreateVault => Message::VaultPathChanged(path.into()),
             Purpose::Import => Message::ImportPathChanged(path.into()),
             Purpose::Backup => Message::BackupPathChanged(path.into()),
@@ -130,18 +151,26 @@ impl App {
             Purpose::Csv => Message::CsvPathChanged(path.into()),
         };
         let _ = self.update(message);
+        if pending.purpose == Purpose::OpenVault && self.check_startup_recovery() {
+            return;
+        }
         self.status = "已选择路径；请检查后再执行操作".into();
     }
 }
 
 impl Purpose {
     fn is_save(self) -> bool {
-        matches!(self, Self::CreateVault | Self::Backup | Self::Csv)
+        matches!(
+            self,
+            Self::CreateVault | Self::Backup | Self::Csv | Self::RecoveryDestination
+        )
     }
 }
 
 fn configured_dialog(purpose: Purpose, path: &str) -> rfd::AsyncFileDialog {
     let (title, label, extensions): (&str, &str, &[&str]) = match purpose {
+        Purpose::RecoverySource => ("选择恢复副本", "加密保险库", &["pmvault", "bak"]),
+        Purpose::RecoveryDestination => ("选择新文件位置", "加密保险库", &["pmvault"]),
         Purpose::OpenVault => ("选择保险库文件", "加密保险库", &["pmvault"]),
         Purpose::CreateVault => ("选择新建位置", "加密保险库", &["pmvault"]),
         Purpose::Import => ("选择导入文件", "支持的导入文件", &["csv", "enc", "db"]),
@@ -368,5 +397,33 @@ mod tests {
         // A nonexistent parent is still retained; building a dialog must not stat it.
         assert!(format!("{dialog:?}").contains("not-created-yet"));
         assert!(!unavailable_parent.exists());
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    #[test]
+    fn recovery_dialog_results_cannot_cross_close_reopen_or_lock() {
+        for lock in [false, true] {
+            let (_dir, mut app) = crate::app::tests::fixture(0);
+            app.lock_with_status("synthetic");
+            app.open_recovery();
+            let _ = app.begin_picker(Purpose::RecoverySource);
+            let pending = app.picker_pending.unwrap();
+            if lock {
+                app.lock_with_status("synthetic");
+            } else {
+                app.dismiss_recovery();
+            }
+            app.open_recovery();
+            app.finish_picker(pending.id, Ok(Some(PathBuf::from("stale.pmvault"))));
+            assert!(app.recovery.as_ref().unwrap().source.is_empty());
+            assert!(app.picker_pending.is_none());
+            let _ = app.begin_picker(Purpose::RecoveryDestination);
+            let pending = app.picker_pending.unwrap();
+            app.finish_picker(pending.id, Ok(Some(PathBuf::from("fresh.pmvault"))));
+            assert_eq!(app.recovery.as_ref().unwrap().destination, "fresh.pmvault");
+        }
     }
 }

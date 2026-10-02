@@ -889,14 +889,32 @@ mod tests {
         fs::write(vault.path(), &external).unwrap();
         assert!(matches!(
             apply_preview(&mut vault, &preview, &options),
-            Err(AppError::ExternalChange)
+            Err(AppError::Persist(failure)) if failure.disposition == crate::storage::transaction::Disposition::ExternalConflict
         ));
         assert_eq!(*vault.body(), original);
         assert_eq!(vault.revision(), revision);
         assert_eq!(fs::read(vault.path()).unwrap(), external);
-        // An unsuccessful save must not consume the preview or mutate its binding.
+        // An external conflict invalidates the session even if old bytes reappear.
         fs::write(vault.path(), disk).unwrap();
-        let report = apply_preview(&mut vault, &preview, &options).unwrap();
+        assert!(apply_preview(&mut vault, &preview, &options).is_err());
+        assert!(vault.save().is_err());
+        vault = VaultSession::open(vault.path(), "synthetic-master").unwrap();
+        let fresh = build_preview(
+            &vault,
+            batch(
+                vec![
+                    item("new", "added category"),
+                    item("first", "restored category"),
+                ],
+                2,
+            ),
+        )
+        .unwrap();
+        let mut options = ImportApplyOptions::for_preview(&fresh);
+        options
+            .conflict_resolutions
+            .insert(1, ConflictResolution::UseImported(id));
+        let report = apply_preview(&mut vault, &fresh, &options).unwrap();
         assert_eq!(report.added, 1);
         assert_eq!(report.updated, 1);
         assert_eq!(vault.revision(), revision + 1);

@@ -21,6 +21,7 @@ use crate::{AppError, Result};
 
 mod actions;
 mod picker;
+mod recovery;
 mod safety;
 #[cfg(test)]
 mod tests;
@@ -59,6 +60,9 @@ struct App {
     preferences_path: Option<std::path::PathBuf>,
     picker_pending: Option<picker::Pending>,
     picker_sequence: u64,
+    recovery: Option<recovery::RecoveryState>,
+    recovery_generation: u64,
+    recovery_notice: Option<crate::storage::recovery::RecoveryInfo>,
     vault_path: String,
     master_password: String,
     confirm_password: String,
@@ -248,6 +252,13 @@ enum Message {
     ClipboardTimeoutChanged(u16),
     PickPath(picker::Purpose),
     PathPicked(u64, std::result::Result<Option<std::path::PathBuf>, String>),
+    OpenRecovery,
+    CloseRecovery(u64),
+    SelectRecoveryCopy(u64, usize),
+    RecoverySourceChanged(u64, String),
+    RecoveryDestinationChanged(u64, String),
+    RecoveryPasswordChanged(u64, String),
+    RestoreRecoveryCopy(u64),
     AuthMode(bool),
     ToggleAuthOptions,
     ToggleCategoryEditor,
@@ -343,6 +354,9 @@ impl App {
             preferences_path: None,
             picker_pending: None,
             picker_sequence: 0,
+            recovery: None,
+            recovery_generation: 0,
+            recovery_notice: None,
             vault_path: "passwords.pmvault".to_string(),
             master_password: String::new(),
             confirm_password: String::new(),
@@ -380,6 +394,7 @@ impl App {
             }
             Err(warning) => app.status = warning,
         }
+        app.check_startup_recovery();
         (
             app,
             platform::set_screen_capture_protection(true)
@@ -455,6 +470,7 @@ impl App {
                     | Message::ApplyImport(_)
                     | Message::CreateBackup
                     | Message::RestoreBackup
+                    | Message::RestoreRecoveryCopy(_)
                     | Message::ExportPlaintextCsv
             )
         {
@@ -528,12 +544,62 @@ impl App {
             }
             Message::PickPath(purpose) => return self.begin_picker(purpose),
             Message::PathPicked(id, result) => self.finish_picker(id, result),
+            Message::OpenRecovery => self.open_recovery(),
+            Message::CloseRecovery(generation) => {
+                if self
+                    .recovery
+                    .as_ref()
+                    .is_some_and(|s| s.generation == generation)
+                {
+                    self.dismiss_recovery();
+                }
+            }
+            Message::SelectRecoveryCopy(generation, index) => {
+                if let Some(state) = &mut self.recovery
+                    && state.generation == generation
+                    && let Some(copy) = state.listing.artifacts.get(index)
+                {
+                    state.source = copy.path.display().to_string();
+                    state.password.zeroize();
+                    self.invalidate_picker();
+                }
+            }
+            Message::RecoverySourceChanged(generation, value) => {
+                if let Some(state) = &mut self.recovery
+                    && state.generation == generation
+                {
+                    state.source = value;
+                    state.password.zeroize();
+                    self.invalidate_picker();
+                }
+            }
+            Message::RecoveryDestinationChanged(generation, value) => {
+                if let Some(state) = &mut self.recovery
+                    && state.generation == generation
+                {
+                    state.destination = value;
+                    self.invalidate_picker();
+                }
+            }
+            Message::RecoveryPasswordChanged(generation, mut value) => {
+                if let Some(state) = &mut self.recovery
+                    && state.generation == generation
+                {
+                    replace_secret(&mut state.password, std::mem::take(&mut value));
+                }
+                value.zeroize();
+            }
+            Message::RestoreRecoveryCopy(generation) => self.restore_recovery_copy(generation),
             Message::AuthMode(creating) => {
+                self.dismiss_recovery();
                 self.creating = creating;
                 self.clear_password_fields();
                 self.status.clear();
             }
-            Message::ToggleAuthOptions => self.auth_options_open = !self.auth_options_open,
+            Message::ToggleAuthOptions => {
+                self.dismiss_recovery();
+                self.auth_options_open = !self.auth_options_open;
+            }
             Message::ToggleCategoryEditor => {
                 self.category_editor_open = !self.category_editor_open;
             }
@@ -550,7 +616,11 @@ impl App {
                     CardAction::OpenWebsite => Message::OpenWebsite,
                 });
             }
-            Message::VaultPathChanged(value) => self.vault_path = value,
+            Message::VaultPathChanged(value) => {
+                self.dismiss_recovery();
+                self.recovery_notice = None;
+                self.vault_path = value;
+            }
             Message::MasterPasswordChanged(value) => {
                 replace_secret(&mut self.master_password, value)
             }
@@ -941,6 +1011,14 @@ impl App {
                     self.note_clipboard_cleanup_failure();
                 }
             },
+        }
+        if let Some(warning) = self
+            .session
+            .as_ref()
+            .and_then(VaultSession::maintenance_warning)
+            && !self.status.contains(warning)
+        {
+            self.status = format!("{}；{}", self.status, warning);
         }
         Task::none()
     }

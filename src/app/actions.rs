@@ -21,6 +21,9 @@ impl App {
     }
 
     pub(super) fn open_vault(&mut self) {
+        if self.check_startup_recovery() {
+            return;
+        }
         if !self.ensure_monitor_ready(cfg!(windows)) {
             return;
         }
@@ -58,6 +61,7 @@ impl App {
     }
 
     pub(super) fn reset_unlocked_state(&mut self) -> bool {
+        self.dismiss_recovery();
         let clipboard_ok = self.revoke_clipboard_session();
         if self.session.is_some() {
             self.clipboard_session = Some(platform::begin_clipboard_session());
@@ -93,7 +97,11 @@ impl App {
         if matches!(&self.panel, Panel::Editor(_)) {
             self.save_editor();
         } else if let Some(session) = &self.session {
-            self.status = match session.verify_current_file() {
+            let result = session.verify_current_file();
+            if let Err(error) = &result {
+                self.handle_persist_error(error);
+            }
+            self.status = match result {
                 Ok(()) => "保险库已保存，磁盘文件校验通过".to_string(),
                 Err(error) => format!("校验失败：{error}"),
             };
@@ -415,7 +423,10 @@ impl App {
                 state.preview = None;
                 state.resolutions.clear();
             }
-            Err(error) => self.status = format!("导入失败：{error}"),
+            Err(error) => {
+                self.handle_persist_error(&error);
+                self.status = format!("导入失败：{error}");
+            }
         }
     }
 
@@ -430,7 +441,7 @@ impl App {
     }
 
     pub(super) fn restore_backup(&mut self) {
-        let (Some(session), Panel::Settings(state)) = (&self.session, &mut self.panel) else {
+        let (Some(session), Panel::Settings(state)) = (&mut self.session, &mut self.panel) else {
             return;
         };
         if !state.confirm_restore {
@@ -438,13 +449,8 @@ impl App {
             return;
         }
         let destination = session.path().to_path_buf();
-        let result = VaultSession::restore_encrypted_backup(
-            Path::new(&state.restore_path),
-            &destination,
-            &state.restore_password,
-            true,
-        )
-        .and_then(|()| VaultSession::open(destination.clone(), &state.restore_password));
+        let result =
+            session.restore_over_current(Path::new(&state.restore_path), &state.restore_password);
         state.restore_password.zeroize();
         state.restore_password.clear();
         match result {
@@ -455,6 +461,7 @@ impl App {
                 self.status = session_status("加密备份已恢复", clipboard_ok);
             }
             Err(error) => {
+                self.handle_persist_error(&error);
                 self.status = format!("恢复失败：{error}");
             }
         }
@@ -524,6 +531,7 @@ impl App {
             Ok(value) => Ok(value),
             Err(error) => {
                 session.restore_body(snapshot);
+                self.handle_persist_error(&error);
                 Err(error)
             }
         }

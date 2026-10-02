@@ -1,6 +1,7 @@
 use std::path::Path;
 
 mod clipboard;
+pub(crate) mod file_transaction;
 #[cfg(any(windows, test))]
 mod security_monitor;
 pub use clipboard::{ClipboardCopyOutcome, ClipboardKind, ClipboardSession};
@@ -39,20 +40,6 @@ pub enum SecurityEvent {
         kind: ClipboardKind,
         outcome: ClipboardCopyOutcome,
     },
-}
-
-pub fn atomic_replace(target: &Path, replacement: &Path, backup: Option<&Path>) -> Result<()> {
-    #[cfg(windows)]
-    {
-        windows_impl::atomic_replace(target, replacement, backup)
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = backup;
-        std::fs::rename(replacement, target)
-            .map_err(|error| AppError::io(target.to_path_buf(), error))
-    }
 }
 
 /// Publish a fully written, synced sibling temporary file without replacing any

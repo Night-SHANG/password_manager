@@ -2777,6 +2777,7 @@ dependencies = [
  "raw-window-handle",
  "rfd",
  "rusqlite",
+ "rustix 1.1.5",
  "secrecy",
  "serde",
  "serde_json",
