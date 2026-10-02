@@ -33,7 +33,7 @@ Native backup is different from import: an encrypted `.pmvault` backup preserves
 The Iced desktop UI is connected directly to the encrypted vault and currently includes:
 
 - create / unlock / lock
-- three-column navigation, search, categories, favorites, recycle bin
+- category sidebar, search/add toolbar, wrapping password cards, favorites and recycle bin
 - add and edit login entries
 - password hidden by default, explicit reveal and copy
 - OS-CSPRNG password generation

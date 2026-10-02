@@ -621,23 +621,24 @@ impl App {
     }
 
     fn selection_actions<'a>(&'a self, entry: &'a EntryRecord) -> Element<'a, Message> {
+        let action = |kind| Message::ContextAction(entry.id, self.context_generation, kind);
         let mut actions = column![
             row![
                 button("复制账号")
-                    .on_press(Message::CopyUsername)
+                    .on_press(action(ContextActionKind::CopyUsername))
                     .style(button::secondary),
                 button("复制密码")
-                    .on_press(Message::CopyPassword)
+                    .on_press(action(ContextActionKind::CopyPassword))
                     .style(button::secondary),
                 button(if self.revealed.is_some() {
                     "隐藏密码"
                 } else {
                     "显示密码"
                 })
-                .on_press(Message::ToggleReveal)
+                .on_press(action(ContextActionKind::ToggleReveal))
                 .style(button::secondary),
                 button("打开网页")
-                    .on_press(Message::OpenWebsite)
+                    .on_press(action(ContextActionKind::OpenWebsite))
                     .style(button::secondary),
             ]
             .spacing(8),
@@ -646,9 +647,9 @@ impl App {
         if entry.is_deleted() {
             actions = actions.push(
                 row![
-                    button("恢复条目").on_press(Message::RestoreSelected),
+                    button("恢复条目").on_press(action(ContextActionKind::Restore)),
                     button("永久删除")
-                        .on_press(Message::RequestPermanentDelete)
+                        .on_press(action(ContextActionKind::RequestPermanentDelete))
                         .style(button::danger),
                 ]
                 .spacing(8),
@@ -656,16 +657,16 @@ impl App {
         } else {
             actions = actions.push(
                 row![
-                    button("编辑条目").on_press(Message::EditSelected),
+                    button("编辑条目").on_press(action(ContextActionKind::Edit)),
                     button(if entry.favorite {
                         "取消收藏"
                     } else {
                         "收藏条目"
                     })
-                    .on_press(Message::ToggleSelectedFavorite)
+                    .on_press(action(ContextActionKind::Favorite))
                     .style(button::secondary),
                     button("移到回收站")
-                        .on_press(Message::MoveSelectedToRecycleBin)
+                        .on_press(action(ContextActionKind::Recycle))
                         .style(button::danger),
                 ]
                 .spacing(8),
@@ -695,7 +696,7 @@ impl App {
             details = details.push(metadata_details(entry));
             content = content
                 .push(
-                    container(scrollable(details).height(Length::Fill))
+                    container(scrollable(details).spacing(8).height(Length::Fill))
                         .id("context-details")
                         .width(Length::Fill)
                         .height(Length::Fill),
@@ -705,7 +706,13 @@ impl App {
         content
             .push(
                 button("关闭菜单")
-                    .on_press(Message::CloseContext)
+                    .on_press(self.selected.map_or(Message::CloseContext, |id| {
+                        Message::ContextAction(
+                            id,
+                            self.context_generation,
+                            ContextActionKind::Close,
+                        )
+                    }))
                     .style(button::secondary),
             )
             .into()

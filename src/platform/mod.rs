@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use iced::{Subscription, Task, window};
+use iced::{Subscription, Task};
+
+#[cfg(windows)]
+use iced::window;
 
 use crate::Result;
 
@@ -84,6 +87,7 @@ pub fn set_screen_capture_protection(enabled: bool) -> Task<std::result::Result<
 
     #[cfg(not(windows))]
     {
+        let _ = enabled;
         Task::done(Ok(false))
     }
 }
@@ -113,6 +117,7 @@ pub fn clear_armed_clipboard_now() -> Result<()> {
     }
 }
 
+#[cfg(any(windows, test))]
 pub(crate) fn should_clear_clipboard(expected_sequence: u32, current_sequence: u32) -> bool {
     expected_sequence != 0 && expected_sequence == current_sequence
 }

@@ -198,3 +198,103 @@ fn gui_long_details_keep_actions_and_close_visible() {
     assert!(app.session.is_none());
     assert!(simulator(&app, SIZES[0]).find(SECRET).is_err());
 }
+
+#[test]
+#[ignore = "Headless UI suite; run explicitly with the tiny-skia backend in CI"]
+fn gui_long_details_reserve_scrollbar_gutter() {
+    let (_directory, mut app, id) = fixture();
+    let _ = app.update(Message::ContextEntry(id));
+    for dark in [false, true] {
+        app.dark_mode = dark;
+        for size in SIZES {
+            let mut ui = simulator(&app, size);
+            let name = format!("details-gutter-{dark}-{}", size.0 as u32);
+            stage(&name, "BEGIN");
+            ui.snapshot(&app.theme())
+                .unwrap()
+                .matches_image(path(&name))
+                .unwrap();
+            let viewport = ui.find(selector::id("context-details")).unwrap().bounds();
+            for field in ["name", "username", "website", "category"] {
+                let bounds = ui
+                    .find(selector::id(format!("context-{field}")))
+                    .unwrap()
+                    .bounds();
+                // Iced's default vertical scrollbar is 10px wide. Require an
+                // additional 8px clear gap so CJK/emoji glyphs never lie below it.
+                assert!(
+                    bounds.x + bounds.width <= viewport.x + viewport.width - 18.0 + 0.1,
+                    "metadata overlaps the scrollbar gutter: {field}"
+                );
+            }
+            stage(&name, "END");
+        }
+    }
+}
+
+#[test]
+#[ignore = "Headless UI suite; run explicitly with the tiny-skia backend in CI"]
+fn gui_long_details_scroll_to_end_and_back_without_moving_actions() {
+    let (_directory, mut app, id) = fixture();
+    let _ = app.update(Message::ContextEntry(id));
+    for dark in [false, true] {
+        app.dark_mode = dark;
+        for size in SIZES {
+            let mut ui = simulator(&app, size);
+            let name = format!("details-scroll-{dark}-{}", size.0 as u32);
+            stage(&name, "BEGIN");
+            let viewport = ui.find(selector::id("context-details")).unwrap().bounds();
+            let close = ui.find("关闭菜单").unwrap().bounds();
+            let reveal = ui.find("显示密码").unwrap().bounds();
+            assert!(
+                ui.find(selector::id("context-category"))
+                    .unwrap()
+                    .visible_bounds()
+                    .is_none()
+            );
+            ui.point_at(viewport.center());
+            ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Pixels {
+                    x: 0.0,
+                    y: -100_000.0,
+                },
+            })]);
+            ui.snapshot(&app.theme())
+                .unwrap()
+                .matches_image(path(&format!("{name}-end")))
+                .unwrap();
+            let tail = ui.find(selector::id("context-category")).unwrap();
+            let visible = tail
+                .visible_bounds()
+                .expect("last field must be visible at scroll end");
+            assert!(
+                (visible.height - tail.bounds().height).abs() < 0.1,
+                "last field is clipped"
+            );
+            assert!(visible.y + visible.height <= viewport.y + viewport.height + 0.1);
+            assert_eq!(ui.find("关闭菜单").unwrap().bounds(), close);
+            assert_eq!(ui.find("显示密码").unwrap().bounds(), reveal);
+            ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Pixels {
+                    x: 0.0,
+                    y: 100_000.0,
+                },
+            })]);
+            let first = ui
+                .find(selector::id("context-name"))
+                .unwrap()
+                .visible_bounds()
+                .unwrap();
+            assert!((first.y - viewport.y).abs() < 0.1);
+            assert!(
+                ui.find(selector::id("context-category"))
+                    .unwrap()
+                    .visible_bounds()
+                    .is_none()
+            );
+            assert!(ui.find(SECRET).is_err());
+            assert_eq!(ui.into_messages().count(), 0);
+            stage(&name, "END");
+        }
+    }
+}

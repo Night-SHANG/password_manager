@@ -59,6 +59,7 @@ struct App {
     selected: Option<Uuid>,
     panel: Panel,
     context_open: bool,
+    context_generation: u64,
     category_name: String,
     revealed: Option<RevealedPassword>,
     dark_mode: bool,
@@ -197,6 +198,20 @@ enum CardAction {
     OpenWebsite,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextActionKind {
+    CopyUsername,
+    CopyPassword,
+    ToggleReveal,
+    OpenWebsite,
+    Edit,
+    Favorite,
+    Recycle,
+    Restore,
+    RequestPermanentDelete,
+    Close,
+}
+
 #[derive(Clone)]
 enum Message {
     AuthMode(bool),
@@ -216,6 +231,7 @@ enum Message {
     SelectEntry(Uuid),
     EditEntry(Uuid),
     ContextEntry(Uuid),
+    ContextAction(Uuid, u64, ContextActionKind),
     CloseContext,
     NewEntry,
     EditSelected,
@@ -294,6 +310,7 @@ impl App {
             selected: None,
             panel: Panel::Vault,
             context_open: false,
+            context_generation: 0,
             category_name: String::new(),
             revealed: None,
             dark_mode: false,
@@ -364,6 +381,24 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // A queued detail action must not operate on a selection that is now
+        // hidden, locked, or outside the password workspace.
+        if matches!(
+            &message,
+            Message::CopyPassword
+                | Message::CopyUsername
+                | Message::EditSelected
+                | Message::OpenWebsite
+                | Message::ToggleSelectedFavorite
+                | Message::MoveSelectedToRecycleBin
+                | Message::RestoreSelected
+                | Message::RequestPermanentDelete
+        ) && !self
+            .selected
+            .is_some_and(|id| self.is_visible_workspace_target(id))
+        {
+            return Task::none();
+        }
         match message {
             Message::AuthMode(creating) => {
                 self.creating = creating;
@@ -375,21 +410,11 @@ impl App {
                 self.category_editor_open = !self.category_editor_open;
             }
             Message::CardAction(id, action) => {
-                let query = self.search.to_lowercase();
-                let valid = matches!(&self.panel, Panel::Vault)
-                    && self
-                        .session
-                        .as_ref()
-                        .and_then(|session| session.entry(id))
-                        .is_some_and(|entry| self.entry_visible(entry, &query));
-                if !valid {
+                if !self.is_visible_workspace_target(id) {
                     return Task::none();
                 }
-                if self.selected != Some(id) {
-                    self.revealed = None;
-                }
                 self.selected = Some(id);
-                self.context_open = false;
+                self.close_context();
                 return self.update(match action {
                     CardAction::CopyUsername => Message::CopyUsername,
                     CardAction::CopyPassword => Message::CopyPassword,
@@ -415,37 +440,64 @@ impl App {
             }
             Message::SearchChanged(value) => {
                 self.search = value;
-                self.context_open = false;
-                self.revealed = None;
+                self.close_context();
             }
             Message::SetNav(nav) => {
                 self.nav = nav;
                 self.selected = None;
                 self.panel = Panel::Vault;
-                self.context_open = false;
-                self.revealed = None;
+                self.close_context();
             }
             Message::SelectEntry(id) => {
+                if !self.is_visible_workspace_target(id) {
+                    return Task::none();
+                }
                 self.selected = Some(id);
-                self.context_open = false;
-                self.revealed = None;
+                self.close_context();
             }
             Message::EditEntry(id) => {
+                if !self.is_visible_workspace_target(id) {
+                    return Task::none();
+                }
                 self.selected = Some(id);
-                self.context_open = false;
+                self.close_context();
                 self.open_editor_for_selected();
             }
             Message::ContextEntry(id) => {
+                if !self.is_visible_workspace_target(id) {
+                    return Task::none();
+                }
+                self.close_context();
                 self.selected = Some(id);
                 self.context_open = true;
                 self.revealed = None;
             }
-            Message::CloseContext => self.context_open = false,
+            Message::ContextAction(id, generation, action) => {
+                if !self.context_open
+                    || self.context_generation != generation
+                    || self.selected != Some(id)
+                    || !self.is_visible_workspace_target(id)
+                {
+                    return Task::none();
+                }
+                return self.update(match action {
+                    ContextActionKind::CopyUsername => Message::CopyUsername,
+                    ContextActionKind::CopyPassword => Message::CopyPassword,
+                    ContextActionKind::ToggleReveal => Message::ToggleReveal,
+                    ContextActionKind::OpenWebsite => Message::OpenWebsite,
+                    ContextActionKind::Edit => Message::EditSelected,
+                    ContextActionKind::Favorite => Message::ToggleSelectedFavorite,
+                    ContextActionKind::Recycle => Message::MoveSelectedToRecycleBin,
+                    ContextActionKind::Restore => Message::RestoreSelected,
+                    ContextActionKind::RequestPermanentDelete => Message::RequestPermanentDelete,
+                    ContextActionKind::Close => Message::CloseContext,
+                });
+            }
+            Message::CloseContext => self.close_context(),
             Message::NewEntry => {
                 if self.session.is_some() && !matches!(&self.panel, Panel::Editor(_)) {
                     self.panel = Panel::Editor(EditorState::new());
-                    self.context_open = false;
-                    self.revealed = None;
+                    self.close_context();
                 }
             }
             Message::EditSelected => self.open_editor_for_selected(),
@@ -501,12 +553,11 @@ impl App {
             Message::SaveEditor => self.save_editor(),
             Message::CancelPanel => {
                 self.panel = Panel::Vault;
-                self.context_open = false;
-                self.revealed = None;
+                self.close_context();
             }
             Message::ToggleReveal => self.toggle_reveal(),
             Message::CopyPassword => {
-                self.context_open = false;
+                self.close_context();
                 if let Some(session) = &self.session
                     && let Some(id) = self.selected
                 {
@@ -520,7 +571,7 @@ impl App {
                 }
             }
             Message::CopyUsername => {
-                self.context_open = false;
+                self.close_context();
                 if let Some(entry) = self.selected_entry() {
                     return clipboard::write::<Message>(entry.username.clone()).discard();
                 }
@@ -531,7 +582,7 @@ impl App {
             Message::RestoreSelected => self.recycle_selected(true),
             Message::RequestPermanentDelete => {
                 if let Some(id) = self.selected {
-                    self.context_open = false;
+                    self.close_context();
                     self.panel = Panel::DeleteEntry(id);
                 }
             }
@@ -539,12 +590,15 @@ impl App {
             Message::CategoryNameChanged(value) => self.category_name = value,
             Message::AddCategory => self.add_category(),
             Message::MoveCategory(name, up) => self.move_category(&name, up),
-            Message::RequestDeleteCategory(name) => self.panel = Panel::DeleteCategory(name),
+            Message::RequestDeleteCategory(name) => {
+                self.close_context();
+                self.panel = Panel::DeleteCategory(name);
+            }
             Message::ConfirmDeleteCategory(name) => self.delete_category(&name),
             Message::OpenImport => {
                 if self.session.is_some() {
+                    self.close_context();
                     self.panel = Panel::Import(ImportState::new());
-                    self.revealed = None;
                 }
             }
             Message::ImportPathChanged(value) => {
@@ -574,7 +628,7 @@ impl App {
             Message::OpenSettings => {
                 if let Some(session) = &self.session {
                     self.panel = Panel::Settings(SettingsState::from_vault(session));
-                    self.revealed = None;
+                    self.close_context();
                 }
             }
             Message::BackupPathChanged(value) => {

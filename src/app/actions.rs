@@ -33,10 +33,9 @@ impl App {
         self.nav = NavFilter::All;
         self.selected = None;
         self.panel = Panel::Vault;
-        self.context_open = false;
+        self.close_context();
         self.search.clear();
         self.category_name.clear();
-        self.revealed = None;
     }
 
     pub(super) fn clear_password_fields(&mut self) {
@@ -67,7 +66,7 @@ impl App {
     }
 
     pub(super) fn open_editor_for_selected(&mut self) {
-        self.context_open = false;
+        self.close_context();
         let Some(session) = &self.session else {
             return;
         };
@@ -140,7 +139,11 @@ impl App {
     }
 
     pub(super) fn toggle_reveal(&mut self) {
-        let Some(id) = self.selected else {
+        let Some(id) = self
+            .selected
+            .filter(|id| self.context_open && self.is_visible_workspace_target(*id))
+        else {
+            self.revealed = None;
             return;
         };
         if self
@@ -166,7 +169,7 @@ impl App {
     }
 
     pub(super) fn open_selected_website(&mut self) {
-        self.context_open = false;
+        self.close_context();
         let Some(entry) = self.selected_entry() else {
             return;
         };
@@ -184,7 +187,7 @@ impl App {
         let Some((id, favorite)) = self.selected_entry().map(|e| (e.id, !e.favorite)) else {
             return;
         };
-        self.context_open = false;
+        self.close_context();
         self.status = match self.mutate_and_save(|session| session.set_favorite(id, favorite)) {
             Ok(()) => "收藏状态已保存".to_string(),
             Err(error) => format!("保存失败：{error}"),
@@ -195,7 +198,7 @@ impl App {
         let Some(id) = self.selected else {
             return;
         };
-        self.context_open = false;
+        self.close_context();
         let result = self.mutate_and_save(|session| {
             if restore {
                 session.restore_from_recycle_bin(id)
@@ -429,6 +432,21 @@ impl App {
             Ok(count) => format!("已导出 {count} 条到明文 CSV，请妥善保护导出文件"),
             Err(error) => format!("导出失败：{error}"),
         };
+    }
+
+    pub(super) fn close_context(&mut self) {
+        self.context_open = false;
+        self.context_generation = self.context_generation.wrapping_add(1);
+        self.revealed = None;
+    }
+
+    pub(super) fn is_visible_workspace_target(&self, id: Uuid) -> bool {
+        matches!(&self.panel, Panel::Vault)
+            && self
+                .session
+                .as_ref()
+                .and_then(|session| session.entry(id))
+                .is_some_and(|entry| self.entry_visible(entry, &self.search.to_lowercase()))
     }
 
     pub(super) fn selected_entry(&self) -> Option<&EntryRecord> {

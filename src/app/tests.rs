@@ -44,6 +44,25 @@ fn apply_messages(app: &mut App, messages: Vec<Message>) {
     }
 }
 
+// Text labels also occur on cards behind the opaque overlay. Traverse into
+// the actual context panel before selecting its button, not the hidden card.
+fn context_button(label: &str) -> impl selector::Selector<Output = selector::Target> + Send + '_ {
+    let panel_id = widget::Id::from("context-panel");
+    let mut in_context = false;
+    move |candidate: selector::Candidate<'_>| {
+        if candidate.id() == Some(&panel_id) {
+            in_context = true;
+        }
+        if in_context
+            && matches!(&candidate, selector::Candidate::Text { content, .. } if *content == label)
+        {
+            Some(selector::Target::from(candidate))
+        } else {
+            None
+        }
+    }
+}
+
 fn click(app: &mut App, label: &str) {
     let mut ui = simulator(app, (1280.0, 800.0));
     ui.click(label).unwrap();
@@ -303,8 +322,11 @@ fn gui_context_and_dark_captures() {
     let id = app.session.as_ref().unwrap().entries()[0].id;
     let _ = app.update(Message::ContextEntry(id));
     capture(&app, "context-actions", SIZES[0]);
+    click(&mut app, "显示密码");
+    assert!(app.revealed.is_some());
     click(&mut app, "关闭菜单");
     assert!(!app.context_open);
+    assert!(app.revealed.is_none());
     let _ = app.update(Message::DarkModeChanged(true));
     capture(&app, "cards-dark", SIZES[1]);
 }
@@ -353,4 +375,184 @@ fn several_hundred_rows_filter_without_revealing_secrets() {
             .count(),
         1
     );
+}
+
+#[test]
+fn entry_interactions_reject_targets_outside_visible_workspace() {
+    for action in [
+        Message::SelectEntry,
+        Message::EditEntry,
+        Message::ContextEntry,
+    ] {
+        for scenario in 0..5 {
+            let (_dir, mut app) = fixture(1);
+            let mut id = app.session.as_ref().unwrap().entries()[0].id;
+            match scenario {
+                0 => id = Uuid::new_v4(),
+                1 => {
+                    let _ = app.update(Message::SearchChanged("absent-entry".into()));
+                }
+                2 => {
+                    let _ = app.update(Message::SetNav(NavFilter::Favorites));
+                }
+                3 => {
+                    let _ = app.update(Message::OpenSettings);
+                }
+                4 => {
+                    let _ = app.update(Message::Lock);
+                }
+                _ => unreachable!(),
+            }
+            let panel = std::mem::discriminant(&app.panel);
+            let _ = app.update(action(id));
+            assert!(
+                app.selected.is_none(),
+                "invalid target changed selection: {scenario}"
+            );
+            assert!(
+                !app.context_open,
+                "invalid target opened details: {scenario}"
+            );
+            assert!(app.revealed.is_none());
+            assert_eq!(std::mem::discriminant(&app.panel), panel);
+        }
+    }
+}
+
+#[test]
+fn leaving_details_drops_the_revealed_buffer() {
+    for action in [
+        Message::CloseContext,
+        Message::CopyUsername,
+        Message::CopyPassword,
+        Message::ToggleSelectedFavorite,
+        Message::NewEntry,
+        Message::EditSelected,
+        Message::OpenSettings,
+        Message::OpenImport,
+        Message::CancelPanel,
+        Message::SearchChanged("absent-entry".into()),
+        Message::SetNav(NavFilter::Favorites),
+        Message::RequestPermanentDelete,
+        Message::RequestDeleteCategory("其他".into()),
+        Message::Lock,
+    ] {
+        let (_dir, mut app) = fixture(1);
+        let id = app.session.as_ref().unwrap().entries()[0].id;
+        let _ = app.update(Message::ContextEntry(id));
+        let _ = app.update(Message::ToggleReveal);
+        assert!(app.revealed.is_some());
+        let action_name = format!("{action:?}");
+        let _ = app.update(action);
+        assert!(!app.context_open, "details remained open: {action_name}");
+        assert!(app.revealed.is_none(), "plaintext retained: {action_name}");
+    }
+}
+
+#[test]
+fn reveal_requires_a_visible_entry_in_open_details() {
+    let (_dir, mut app) = fixture(1);
+    let id = app.session.as_ref().unwrap().entries()[0].id;
+    let _ = app.update(Message::SelectEntry(id));
+    let _ = app.update(Message::ToggleReveal);
+    assert!(app.revealed.is_none(), "revealed without open details");
+    let _ = app.update(Message::ContextEntry(id));
+    let _ = app.update(Message::ToggleReveal);
+    assert!(app.revealed.is_some());
+    let _ = app.update(Message::CloseContext);
+    let _ = app.update(Message::ToggleReveal);
+    assert!(app.revealed.is_none(), "delayed reveal after close");
+    let _ = app.update(Message::SearchChanged("absent-entry".into()));
+    let _ = app.update(Message::ToggleReveal);
+    assert!(app.revealed.is_none());
+    let _ = app.update(Message::Lock);
+    let _ = app.update(Message::ToggleReveal);
+    assert!(app.revealed.is_none());
+}
+
+#[test]
+fn stale_selected_actions_do_not_operate_on_hidden_entries() {
+    for action in [
+        Message::CopyPassword,
+        Message::CopyUsername,
+        Message::EditSelected,
+        Message::ToggleSelectedFavorite,
+        Message::MoveSelectedToRecycleBin,
+        Message::RequestPermanentDelete,
+    ] {
+        let (_dir, mut app) = fixture(1);
+        let id = app.session.as_ref().unwrap().entries()[0].id;
+        let _ = app.update(Message::ContextEntry(id));
+        let _ = app.update(Message::SearchChanged("absent-entry".into()));
+        let task = app.update(action);
+        assert_eq!(task.units(), 0, "hidden selection emitted a clipboard task");
+        assert!(matches!(app.panel, Panel::Vault));
+        assert!(app.revealed.is_none());
+        let entry = app.session.as_ref().unwrap().entry(id).unwrap();
+        assert!(!entry.favorite && !entry.is_deleted());
+    }
+}
+
+#[test]
+#[ignore = "Headless UI suite; run explicitly with the tiny-skia backend in CI"]
+fn gui_context_actions_keep_their_original_target() {
+    let (_dir, mut app) = fixture(2);
+    let ids: Vec<_> = app
+        .session
+        .as_ref()
+        .unwrap()
+        .entries()
+        .iter()
+        .map(|e| e.id)
+        .collect();
+    for label in [
+        "收藏条目",
+        "复制账号",
+        "复制密码",
+        "显示密码",
+        "编辑条目",
+        "移到回收站",
+        "关闭菜单",
+    ] {
+        for destination in 0..3 {
+            let _ = app.update(Message::ContextEntry(ids[0]));
+            let messages = {
+                let mut ui = simulator(&app, SIZES[0]);
+                ui.click(context_button(label)).unwrap();
+                ui.into_messages().collect::<Vec<_>>()
+            };
+            assert!(
+                !messages.is_empty(),
+                "context button emitted no message: {label}"
+            );
+            if destination == 0 {
+                let _ = app.update(Message::ContextEntry(ids[1]));
+            } else {
+                let _ = app.update(Message::CloseContext);
+                if destination == 2 {
+                    let _ = app.update(Message::ContextEntry(ids[0]));
+                }
+            }
+            for message in messages {
+                assert_eq!(
+                    app.update(message).units(),
+                    0,
+                    "stale action emitted a task: {label}"
+                );
+            }
+            assert!(matches!(app.panel, Panel::Vault));
+            assert!(app.revealed.is_none(), "stale reveal: {label}");
+            assert_eq!(
+                app.context_open,
+                destination != 1,
+                "stale dismissal: {label}"
+            );
+            for entry in app.session.as_ref().unwrap().entries() {
+                assert!(
+                    !entry.favorite && !entry.is_deleted(),
+                    "stale mutation: {label}"
+                );
+            }
+        }
+    }
 }
