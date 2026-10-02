@@ -247,6 +247,12 @@ pub(crate) fn windows_publish_error(code: i32) -> PublishError {
         documented_no_progress: matches!(code, 1175 | 1176 | 32 | 33 | 5),
     }
 }
+
+#[cfg(all(windows, test))]
+pub(crate) fn short_path_for_test(path: &Path) -> io::Result<std::path::PathBuf> {
+    native::short_path_for_test(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,9 +315,4 @@ mod tests {
         assert!(!transaction.join("displaced.pmvault").exists());
         assert_eq!(std::fs::read(legacy).unwrap(), b"unknown backup");
     }
-}
-
-#[cfg(all(windows, test))]
-pub(crate) fn short_path_for_test(path: &Path) -> io::Result<std::path::PathBuf> {
-    native::short_path_for_test(path)
 }

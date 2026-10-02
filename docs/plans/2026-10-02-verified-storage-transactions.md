@@ -281,3 +281,23 @@ Dependency lock SHA-256:
 Windows native alias/sharing execution, complete Windows build/packaging and
 exact-source artifact verification remain separate gates. Local API compilation
 is not a native-Windows runtime pass.
+
+## Windows CI35 correction
+
+[Preflight #35](https://github.com/Night-SHANG/password_manager/actions/runs/37031320501)
+ran the storage changes at `d2cdbcba8e809ece08850bfc5d74428ce9b188b2`.
+Windows passed 227 Rust tests, 24 GUI tests and 13 PowerShell lock-writeback
+checks; dependency policy, secret scan and shared-lock checks also passed.
+The run then failed strict Windows Clippy, so it produced no release package.
+
+The follow-up makes `DirBuilder` mutable only on Unix and moves the existing
+Windows test helper before its test module. Unix mode `0700`, all transaction
+behavior and all lint requirements remain unchanged; no suppression is added.
+Independent review found no behavior or API change. Fresh local validation
+passed formatting, all-target check, strict all-feature Clippy and 233 Rust
+tests. An isolated checker also passed strict Windows API Clippy, but it does
+not cover the full application or execute Windows tests. Complete Windows
+Clippy, release packaging and artifact verification require the next CI run.
+Fresh follow-up GUI validation also passed all 24 headless tests. Python policy
+checks passed 12 tests with 8 PowerShell-only checks skipped locally. These local
+results do not replace the pending complete Windows gate.

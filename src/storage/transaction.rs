@@ -72,7 +72,10 @@ struct Staging {
 impl Staging {
     fn new(ns: &Namespace, id: Uuid) -> Result<Self> {
         let path = ns.directory(id);
+        #[cfg(unix)]
         let mut builder = fs::DirBuilder::new();
+        #[cfg(not(unix))]
+        let builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
