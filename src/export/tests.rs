@@ -451,14 +451,14 @@ fn namespace_changes_and_same_inode_corruption_prevent_success() {
         "append",
         "during-append",
         "during-truncate",
-        "parent",
     ] {
         let parent = dir.path().join(schedule);
         std::fs::create_dir(&parent).unwrap();
         let target = parent.join("out.csv");
         let t = target.clone();
-        let p = parent.clone();
-        let io = ProbeIo::new(move |op, occurrence| {
+        let applied = std::rc::Rc::new(Cell::new(false));
+        let applied_hook = applied.clone();
+        let io = namespace_probe(schedule, move |op, occurrence| {
             let trigger = if ["during-read", "during-append", "during-truncate"].contains(&schedule)
             {
                 op == Op::Read && occurrence == 1
@@ -498,35 +498,60 @@ fn namespace_changes_and_same_inode_corruption_prevent_success() {
                             .open(&t)?
                             .write_all(b"extra")?;
                     }
-                    "parent" => {
-                        std::fs::rename(&p, p.with_extension("moved"))?;
-                        std::fs::create_dir(&p)?;
-                        std::fs::write(&t, b"competitor sentinel")?;
-                    }
                     _ => unreachable!(),
                 }
+                applied_hook.set(true);
             }
             Ok(())
         });
-        let failure = export_with(&vault, &target, &io).unwrap_err();
-        retained(&failure);
+        let failure = export_with(&vault, &target, &io).expect_err(schedule);
+        assert!(
+            applied.get(),
+            "namespace schedule did not complete: {schedule}"
+        );
+        let observation = retained(&failure);
         assert_eq!(
             failure.stage,
             if schedule == "during-read" {
                 Stage::VerifyPath
             } else {
                 Stage::VerifyOutput
-            }
+            },
+            "wrong detection stage for completed schedule {schedule}: {failure:?}"
         );
         if schedule == "corrupt" {
-            assert_eq!(failure.cause, Cause::DigestChanged);
+            assert_eq!(failure.cause, Cause::DigestChanged, "{schedule}");
         }
-        if ["replace", "during-read", "parent"].contains(&schedule) {
-            assert_eq!(std::fs::read(&target).unwrap(), b"competitor sentinel");
+        if ["replace", "same-data", "during-read"].contains(&schedule) {
+            assert_eq!(failure.cause, Cause::IdentityChanged, "{schedule}");
+            assert_eq!(
+                observation.target,
+                ObservedTarget::TargetDifferent,
+                "{schedule}"
+            );
+            let moved = target.with_extension("moved");
+            assert!(moved.is_file(), "owned output must remain: {schedule}");
+            if schedule == "same-data" {
+                assert_eq!(
+                    std::fs::read(&target).unwrap(),
+                    std::fs::read(moved).unwrap(),
+                    "{schedule}"
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read(&target).unwrap(),
+                    b"competitor sentinel",
+                    "{schedule}"
+                );
+            }
         }
         if schedule == "missing" {
-            assert_eq!(retained(&failure).target, ObservedTarget::TargetMissing);
-            assert!(!target.exists());
+            assert_eq!(
+                observation.target,
+                ObservedTarget::TargetMissing,
+                "{schedule}"
+            );
+            assert!(!target.exists(), "{schedule}");
         }
         unchanged(&vault, &body, &disk);
     }
@@ -1097,4 +1122,212 @@ fn late_secret_write_and_populated_read_unwinds_wipe_named_owners_without_retry(
         );
         unchanged(&vault, &body, &disk);
     }
+}
+
+// Namespace mutations belong to the test actor, not the exporter's I/O result.
+// Fail setup loudly; never count a failed mutation as successful fault coverage.
+fn namespace_probe(
+    schedule: &'static str,
+    mut hook: impl FnMut(Op, usize) -> io::Result<()> + 'static,
+) -> ProbeIo {
+    ProbeIo::new(move |op, occurrence| {
+        hook(op, occurrence).unwrap_or_else(|error| {
+            panic!("namespace fixture {schedule} failed at {op:?}#{occurrence}: {error}")
+        });
+        Ok(())
+    })
+}
+
+#[test]
+fn namespace_injection_failure_must_not_masquerade_as_product_rejection() {
+    let (dir, vault) = synthetic();
+    let io = namespace_probe("denied synthetic rename", |op, occurrence| {
+        if op == Op::Open && occurrence == 1 {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        Ok(())
+    });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        export_with(&vault, &dir.path().join("fixture-error.csv"), &io)
+    }));
+    assert!(
+        result.is_err(),
+        "a failed namespace mutation must fail the test harness, not become an expected ExportFailure"
+    );
+}
+
+#[test]
+fn parent_redirection_model_requires_original_full_path_and_rejects_equal_bytes() {
+    let (dir, vault) = synthetic();
+    let body = serde_json::to_vec(vault.body()).unwrap();
+    let disk = std::fs::read(vault.path()).unwrap();
+    let reference = dir.path().join("reference.csv");
+    export_with(&vault, &reference, &SystemIo).unwrap();
+    let expected = std::fs::read(reference).unwrap();
+    for redirect_on in [1, 2] {
+        let parent = dir.path().join(format!("logical-{redirect_on}"));
+        let other_parent = dir.path().join(format!("redirected-{redirect_on}"));
+        std::fs::create_dir(&other_parent).unwrap();
+        let target = parent.join("out.csv");
+        let competitor = other_parent.join("out.csv");
+        std::fs::write(&competitor, &expected).unwrap();
+        struct RedirectParent {
+            full_target: PathBuf,
+            competitor: PathBuf,
+            redirect_on: usize,
+            opens: Cell<usize>,
+            applied: Cell<bool>,
+        }
+        impl ExportIo for RedirectParent {
+            fn open(&self, target: &Path) -> io::Result<File> {
+                // This is an explicit namespace-resolution model, not a claim
+                // that Windows permits renaming an ancestor with open children.
+                assert_eq!(
+                    target, self.full_target,
+                    "must re-open the captured full target"
+                );
+                let index = self.opens.get() + 1;
+                self.opens.set(index);
+                if index >= self.redirect_on {
+                    self.applied.set(true);
+                    SystemIo.open(&self.competitor)
+                } else {
+                    SystemIo.open(target)
+                }
+            }
+        }
+        let io = RedirectParent {
+            full_target: target.clone(),
+            competitor: competitor.clone(),
+            redirect_on,
+            opens: Cell::new(0),
+            applied: Cell::new(false),
+        };
+        let failure = export_with(&vault, &target, &io).unwrap_err();
+        assert!(
+            io.applied.get(),
+            "redirection {redirect_on} was not exercised"
+        );
+        assert_eq!(
+            failure.stage,
+            if redirect_on == 1 {
+                Stage::VerifyOutput
+            } else {
+                Stage::VerifyPath
+            }
+        );
+        assert_eq!(
+            failure.cause,
+            Cause::IdentityChanged,
+            "redirection {redirect_on}"
+        );
+        assert_eq!(retained(&failure).target, ObservedTarget::TargetDifferent);
+        assert_eq!(failure.target, target);
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            expected,
+            "model-owned output preserved"
+        );
+        assert_eq!(
+            std::fs::read(competitor).unwrap(),
+            expected,
+            "same-data competitor preserved"
+        );
+        unchanged(&vault, &body, &disk);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_real_parent_replacement_is_detected_before_read_and_at_final_checkpoint() {
+    let (dir, vault) = synthetic();
+    let body = serde_json::to_vec(vault.body()).unwrap();
+    let disk = std::fs::read(vault.path()).unwrap();
+    for swap_on in [1, 2] {
+        let parent = dir.path().join(format!("parent-{swap_on}"));
+        std::fs::create_dir(&parent).unwrap();
+        let target = parent.join("out.csv");
+        let moved_parent = parent.with_extension("moved");
+        let p = parent.clone();
+        let t = target.clone();
+        let m = moved_parent.clone();
+        let applied = std::rc::Rc::new(Cell::new(false));
+        let a = applied.clone();
+        let io = namespace_probe("Linux parent replacement", move |op, occurrence| {
+            if op == Op::Open && occurrence == swap_on {
+                std::fs::rename(&p, &m)?;
+                std::fs::create_dir(&p)?;
+                std::fs::write(&t, b"competitor sentinel")?;
+                a.set(true);
+            }
+            Ok(())
+        });
+        let failure = export_with(&vault, &target, &io).unwrap_err();
+        assert!(applied.get(), "parent swap {swap_on} not applied");
+        assert_eq!(
+            failure.stage,
+            if swap_on == 1 {
+                Stage::VerifyOutput
+            } else {
+                Stage::VerifyPath
+            }
+        );
+        assert_eq!(
+            failure.cause,
+            Cause::IdentityChanged,
+            "parent swap {swap_on}"
+        );
+        assert_eq!(retained(&failure).target, ObservedTarget::TargetDifferent);
+        assert_eq!(std::fs::read(&target).unwrap(), b"competitor sentinel");
+        assert!(
+            std::fs::read(moved_parent.join("out.csv"))
+                .unwrap()
+                .starts_with(b"name,url,username,password,category,notes\n")
+        );
+        unchanged(&vault, &body, &disk);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_parent_rename_is_denied_with_open_child_even_with_delete_sharing() {
+    let (dir, vault) = synthetic();
+    let body = serde_json::to_vec(vault.body()).unwrap();
+    let disk = std::fs::read(vault.path()).unwrap();
+    let parent = dir.path().join("parent");
+    std::fs::create_dir(&parent).unwrap();
+    let target = parent.join("out.csv");
+    let moved = parent.with_extension("moved");
+    let p = parent.clone();
+    let m = moved.clone();
+    let attempted = std::rc::Rc::new(Cell::new(false));
+    let a = attempted.clone();
+    // ProbeIo::create uses Rust's default READ|WRITE|DELETE sharing, unlike the
+    // production SHARE_READ owner. Parent rename still has the open-child rule:
+    // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
+    let io = namespace_probe("Windows parent rename denied", move |op, occurrence| {
+        if op == Op::Open && occurrence == 1 {
+            let error = std::fs::rename(&p, &m)
+                .expect_err("Windows must retain the parent while its child is open");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied,
+                "unexpected parent rename failure: {error}"
+            );
+            assert!(p.is_dir());
+            assert!(!m.exists());
+            a.set(true);
+        }
+        Ok(())
+    });
+    // A competing operation denied by the OS does not itself make export fail.
+    assert_eq!(export_with(&vault, &target, &io).unwrap(), 3);
+    assert!(attempted.get());
+    let output = std::fs::read(&target).unwrap();
+    assert!(output.starts_with(b"name,url,username,password,category,notes\n"));
+    unchanged(&vault, &body, &disk);
+    // After the owned and verifier handles close, the same rename can succeed.
+    std::fs::rename(&parent, &moved).unwrap();
+    assert!(!parent.exists());
+    assert_eq!(std::fs::read(moved.join("out.csv")).unwrap(), output);
 }

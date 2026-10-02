@@ -334,8 +334,11 @@ mod tests {
     fn export_close_prompt_accepts_only_current_clipboard_acknowledgment() {
         let (_dir, mut app, _) = failed_app();
         app.note_clipboard_cleanup_failure();
-        let clipboard_generation = app.clipboard_warning_generation;
         let _ = app.update(Message::CloseRequested(iced::window::Id::unique()));
+        // Close revokes the native clipboard permit. That can itself produce a
+        // newer cleanup warning (for example without a Windows monitor in CI).
+        // Use the token the close view actually renders, not a pre-close token.
+        let clipboard_generation = app.clipboard_warning_generation;
         let _ = app.update(Message::AcknowledgeClipboardCleanup(
             clipboard_generation.wrapping_sub(1),
         ));
@@ -346,6 +349,34 @@ mod tests {
             "rendered clipboard acknowledgment must work during close warning"
         );
         assert!(app.export_notice.is_some());
+        assert!(app.export_close_prompt.is_some());
+        assert!(app.session.is_none());
+    }
+
+    #[test]
+    fn export_close_prompt_rejects_clipboard_ack_after_a_new_native_failure() {
+        let (_dir, mut app, _) = failed_app();
+        app.note_clipboard_cleanup_failure();
+        let _ = app.update(Message::CloseRequested(iced::window::Id::unique()));
+        let rendered_generation = app.clipboard_warning_generation;
+        let notice_generation = app.export_notice.as_ref().unwrap().generation;
+        // Deterministic delivery of a later native failure on every platform.
+        let _ = app.update(Message::PlatformSecurity(
+            SecurityEvent::ClipboardCleanupFailed,
+        ));
+        let current_generation = app.clipboard_warning_generation;
+        assert_ne!(current_generation, rendered_generation);
+        let _ = app.update(Message::AcknowledgeClipboardCleanup(rendered_generation));
+        assert!(
+            app.clipboard_cleanup_failed,
+            "old rendered acknowledgment cannot dismiss a new warning"
+        );
+        let _ = app.update(Message::AcknowledgeClipboardCleanup(current_generation));
+        assert!(!app.clipboard_cleanup_failed);
+        assert_eq!(
+            app.export_notice.as_ref().unwrap().generation,
+            notice_generation
+        );
         assert!(app.export_close_prompt.is_some());
         assert!(app.session.is_none());
     }
