@@ -6,6 +6,10 @@ const SECRET: &str = "synthetic-long-text-password-only";
 const SIZES: [(f32, f32); 3] = [(960.0, 640.0), (1280.0, 800.0), (1600.0, 900.0)];
 
 fn fixture() -> (tempfile::TempDir, App, uuid::Uuid) {
+    fixture_with_path_repeats(40)
+}
+
+fn fixture_with_path_repeats(path_repeats: usize) -> (tempfile::TempDir, App, uuid::Uuid) {
     let directory = tempfile::tempdir().unwrap();
     let mut app = App::initial();
     let path = directory.path().join("synthetic-metadata.pmvault");
@@ -13,7 +17,7 @@ fn fixture() -> (tempfile::TempDir, App, uuid::Uuid) {
     let id = vault
         .add_entry(EntryDraft::login(
             "很长的中文名称😀".repeat(20),
-            format!("https://example.test/{}", "long-path/".repeat(40)),
+            format!("https://example.test/{}", "long-path/".repeat(path_repeats)),
             "很长的账号".repeat(40),
             SECRET,
         ))
@@ -269,7 +273,8 @@ fn gui_long_details_scroll_to_end_and_back_without_moving_actions() {
                 .expect("last field must be visible at scroll end");
             assert!(
                 (visible.height - tail.bounds().height).abs() < 0.1,
-                "last field is clipped"
+                "last field is clipped in {name}: viewport={viewport:?}, tail={:?}, visible={visible:?}",
+                tail.bounds()
             );
             assert!(visible.y + visible.height <= viewport.y + viewport.height + 0.1);
             assert_eq!(ui.find("关闭菜单").unwrap().bounds(), close);
@@ -296,5 +301,41 @@ fn gui_long_details_scroll_to_end_and_back_without_moving_actions() {
             assert_eq!(ui.into_messages().count(), 0);
             stage(&name, "END");
         }
+    }
+}
+
+#[test]
+#[ignore = "Headless UI suite; run explicitly with the tiny-skia backend in CI"]
+fn gui_detail_tail_survives_fractional_line_heights() {
+    for repeats in [44, 48, 52, 56] {
+        let (_directory, mut app, id) = fixture_with_path_repeats(repeats);
+        let _ = app.update(Message::ContextEntry(id));
+        let mut ui = simulator(&app, SIZES[0]);
+        let viewport = ui.find(selector::id("context-details")).unwrap().bounds();
+        ui.point_at(viewport.center());
+        ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Pixels {
+                x: 0.0,
+                y: -100_000.0,
+            },
+        })]);
+        let tail = ui.find(selector::id("context-category")).unwrap();
+        let visible = tail.visible_bounds().unwrap();
+        assert!(
+            (visible.height - tail.bounds().height).abs() < 0.1,
+            "tail clipped at repeats={repeats}: viewport={viewport:?}, tail={:?}, visible={visible:?}",
+            tail.bounds()
+        );
+        assert!(
+            viewport.y + viewport.height - (visible.y + visible.height) >= 7.4,
+            "last field needs bottom breathing room despite scroll rounding"
+        );
+        let name = format!("details-fractional-tail-{repeats}");
+        stage(&name, "BEGIN");
+        ui.snapshot(&app.theme())
+            .unwrap()
+            .matches_image(path(&name))
+            .unwrap();
+        stage(&name, "END");
     }
 }

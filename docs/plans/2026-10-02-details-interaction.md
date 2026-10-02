@@ -27,7 +27,7 @@ Linux compilation exposed three pre-existing strict-Clippy errors in Windows-onl
 
 Local execution uses Linux, Rust stable 1.99.0 and the committed lockfile. Windows-specific PowerShell, Gitleaks, cargo-deny, optimized Windows packaging and Windows security lifecycle remain separate CI/target-machine gates. No Windows 10 acceptance is inferred from Linux screenshots or GitHub-hosted Windows Server.
 
-The existing shared lock/hash, formatting, check, tests, strict Clippy, secret/log checks, GUI-before-package, binary self-test and unpacked self-test gates are unchanged. After the development push, stop CI polling and report the triggered run without treating it as passed. No main merge, release tag or formal release is part of this change.
+The existing shared lock/hash, formatting, check, tests, strict Clippy, secret/log checks, GUI-before-package, binary self-test and unpacked self-test gates are unchanged. The original request stopped polling after push; the user later clarified that dot may autonomously monitor and repair CI (see `2026-10-02-detail-tail-rounding.md`). A triggered run is not a passed run. No main merge, release tag or formal release is part of this change.
 
 Native file dialogs remain the next bounded UI group. Nonblocking KDF/import, native-vault merge/reimport boundaries, performance, clipboard ownership/races and actual Windows 10 22H2 acceptance remain open. Batch E is not closed.
 

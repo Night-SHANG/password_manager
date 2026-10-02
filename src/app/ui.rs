@@ -693,7 +693,12 @@ impl App {
                     .spacing(4),
                 );
             }
-            details = details.push(metadata_details(entry));
+            // Scrollable rounds its translation to whole logical pixels. Text
+            // line heights can be fractional, so keep the last glyphs clear
+            // of the clip edge even when the bottom offset rounds down.
+            details = details
+                .push(metadata_details(entry))
+                .padding(iced::Padding::ZERO.bottom(8));
             content = content
                 .push(
                     container(scrollable(details).spacing(8).height(Length::Fill))
