@@ -102,6 +102,8 @@ impl App {
         }
         let now = Instant::now();
         let snapshot = self.operations.authority.snapshot(now);
+        #[cfg(test)]
+        super::operation_tests::before_admission();
         let admission = match self
             .operations
             .authority
@@ -165,8 +167,25 @@ impl App {
         }
         self.attach_launch_retired();
     }
+    fn retire_auth_passwords(&mut self) {
+        let retired = RetiredUi {
+            passwords: [
+                Some(zeroize::Zeroizing::new(std::mem::take(
+                    &mut self.master_password,
+                ))),
+                Some(zeroize::Zeroizing::new(std::mem::take(
+                    &mut self.confirm_password,
+                ))),
+                None,
+                None,
+            ],
+            ..RetiredUi::default()
+        };
+        self.retire_operation_ui(retired);
+    }
     pub(super) fn start_auth(&mut self, create: bool) {
         if !self.ensure_monitor_ready(cfg!(windows)) {
+            self.retire_auth_passwords();
             return;
         }
         let kind = if create {
@@ -182,6 +201,11 @@ impl App {
                 "保险库已解锁"
             },
         ) else {
+            // Native revocation can win after the UI readiness check. Other
+            // admission failures leave current input available for retry.
+            if !self.ensure_monitor_ready(cfg!(windows)) {
+                self.retire_auth_passwords();
+            }
             return;
         };
         let path = std::path::PathBuf::from(&self.vault_path);
@@ -882,8 +906,31 @@ impl App {
             },
         );
     }
+    fn retire_recovery_password(&mut self, generation: u64) {
+        let Some(state) = self
+            .recovery
+            .as_mut()
+            .filter(|state| state.generation == generation)
+        else {
+            return;
+        };
+        let recovery_password = Some(std::mem::take(&mut state.password));
+        self.retire_operation_ui(RetiredUi {
+            recovery_password,
+            ..RetiredUi::default()
+        });
+    }
     pub(super) fn start_restore_new(&mut self, generation: u64) {
-        if !self.ensure_monitor_ready(cfg!(windows)) || self.session.is_some() {
+        if self.session.is_some()
+            || !self
+                .recovery
+                .as_ref()
+                .is_some_and(|state| state.generation == generation)
+        {
+            return;
+        }
+        if !self.ensure_monitor_ready(cfg!(windows)) {
+            self.retire_recovery_password(generation);
             return;
         }
         let Some(state) = self
@@ -901,6 +948,9 @@ impl App {
             OperationKind::RestoreNew,
             "选定副本已验证并恢复到新文件。原文件与恢复材料均已保留；请输入主密码解锁新文件。",
         ) else {
+            if !self.ensure_monitor_ready(cfg!(windows)) {
+                self.retire_recovery_password(generation);
+            }
             return;
         };
         let state = self.recovery.as_mut().expect("admitted recovery form");

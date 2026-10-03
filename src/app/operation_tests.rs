@@ -1,5 +1,410 @@
 use super::*;
 
+thread_local! {
+    static BEFORE_ADMISSION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn before_admission() {
+    let hook = BEFORE_ADMISSION.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+fn revoke_monitor_at_admission(app: &App, registration: Uuid) {
+    let authority = app.operations.authority.clone();
+    BEFORE_ADMISSION.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move || {
+            let now = std::time::Instant::now();
+            assert!(authority.snapshot(now).monitor_ready);
+            assert!(authority.monitor_failed_for(registration, now));
+        }));
+    });
+}
+
+/// Model a bound Windows monitor without a process-global native registration.
+/// Readiness must still come from the exact coordinator registration token.
+fn require_unready_monitor(app: &mut App) -> Uuid {
+    let authority = std::sync::Arc::new(crate::operations::authority::Coordinator::new(true));
+    let registration = Uuid::new_v4();
+    assert!(authority.bind_monitor_registration(registration));
+    app.operations.service =
+        Some(crate::operations::runner::OperationService::new(authority.clone()).unwrap());
+    app.operations.authority = authority;
+    // Exercise the stricter native gate even when a displayed Ready is stale.
+    app.security_monitor_ready = true;
+    registration
+}
+
+#[test]
+fn startup_monitor_retry_ready_retires_inputs_before_fresh_auth_without_manual_lock() {
+    startup_monitor_retry_ready(false);
+    startup_monitor_retry_ready(true);
+}
+
+fn startup_monitor_retry_ready(retry_during_cleanup: bool) {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("startup-retry.pmvault");
+    let mut app = App::initial();
+    // This monitor model has no native window responder. WDA is covered by
+    // native acceptance, not by this authority/retirement regression.
+    app.screen_capture_protection_requested = false;
+    let registration = require_unready_monitor(&mut app);
+    app.security_monitor_ready = false;
+    app.vault_path = destination.display().to_string();
+    app.master_password = "synthetic-startup-retry".into();
+    app.confirm_password = "synthetic-startup-retry".into();
+    let old_stamp = app.operations.authority.snapshot(Instant::now()).stamp;
+    // The native retry branch revokes synchronously but sends no MonitorFailed.
+    assert!(
+        app.operations
+            .authority
+            .monitor_retryable_failure_for(registration, Instant::now())
+    );
+    if !retry_during_cleanup {
+        assert!(app.operations.authority.monitor_ready_for(registration));
+    }
+    let (arrived_tx, arrived_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    app.operations
+        .service
+        .as_ref()
+        .unwrap()
+        .before_result_ready_for_test(move || {
+            arrived_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+    let ready = app.update(if retry_during_cleanup {
+        Message::SecurityTick(Instant::now())
+    } else {
+        Message::PlatformSecurity(SecurityEvent::MonitorReady)
+    });
+    assert!(
+        app.master_password.is_empty(),
+        "first Ready must retire inputs from the revoked startup context"
+    );
+    assert!(app.confirm_password.is_empty());
+    arrived_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("startup cleanup reaches real worker");
+    let later_ready = if retry_during_cleanup {
+        assert!(
+            app.operations
+                .authority
+                .monitor_retryable_failure_for(registration, Instant::now())
+        );
+        assert!(app.operations.authority.monitor_ready_for(registration));
+        app.update(Message::PlatformSecurity(SecurityEvent::MonitorReady))
+    } else {
+        Task::none()
+    };
+    assert!(
+        !app.operations
+            .authority
+            .snapshot(Instant::now())
+            .fully_locked
+    );
+    let busy = app.update(Message::CreateVault);
+    assert!(app.operations.active.is_none());
+    assert!(!destination.exists());
+    release_tx.send(()).unwrap();
+    tests::drain_task(&mut app, Task::batch([ready, later_ready, busy]));
+    let snapshot = app.operations.authority.snapshot(Instant::now());
+    assert!(
+        snapshot.fully_locked && !snapshot.masked && snapshot.monitor_ready,
+        "retry_during_cleanup={retry_during_cleanup}; {snapshot:?}"
+    );
+    app.test_update(Message::Ui(old_stamp, Box::new(Message::CreateVault)));
+    assert!(app.session.is_none() && !destination.exists());
+    app.master_password = "synthetic-startup-retry".into();
+    app.confirm_password = "synthetic-startup-retry".into();
+    app.test_update(Message::CreateVault);
+    assert!(
+        app.session.is_some(),
+        "startup recovery must allow fresh explicit auth without manual Lock"
+    );
+}
+
+#[test]
+fn monitor_revoked_between_ready_and_auth_admission_retires_passwords() {
+    for create in [false, true] {
+        let (dir, mut app) = tests::fixture(0);
+        app.test_update(Message::Lock);
+        let registration = require_unready_monitor(&mut app);
+        assert!(app.operations.authority.monitor_ready_for(registration));
+        if create {
+            app.vault_path = dir
+                .path()
+                .join("must-not-create.pmvault")
+                .display()
+                .to_string();
+        }
+        let original = std::fs::read(&app.vault_path).ok();
+        app.master_password = "gui-synthetic-master-only".into();
+        app.confirm_password = "gui-synthetic-master-only".into();
+        revoke_monitor_at_admission(&app, registration);
+        let rejected = app.update(if create {
+            Message::CreateVault
+        } else {
+            Message::OpenVault
+        });
+        assert!(
+            !app.operations
+                .authority
+                .snapshot(std::time::Instant::now())
+                .monitor_ready,
+            "the admission barrier must revoke native authority"
+        );
+        assert!(
+            app.master_password.is_empty(),
+            "racing monitor rejection must retire auth input without a UI failure event"
+        );
+        assert!(app.confirm_password.is_empty());
+        assert!(app.session.is_none() && app.operations.active.is_none());
+        assert_eq!(std::fs::read(&app.vault_path).ok(), original);
+        tests::drain_task(&mut app, rejected);
+        assert!(
+            app.operations
+                .authority
+                .snapshot(std::time::Instant::now())
+                .fully_locked
+        );
+    }
+}
+
+#[test]
+fn monitor_revoked_between_ready_and_recovery_admission_retires_password() {
+    let (dir, mut app) = tests::fixture(0);
+    let source = std::path::PathBuf::from(&app.vault_path);
+    let original = std::fs::read(&source).unwrap();
+    app.test_update(Message::Lock);
+    let registration = require_unready_monitor(&mut app);
+    assert!(app.operations.authority.monitor_ready_for(registration));
+    app.test_update(Message::OpenRecovery);
+    let destination = dir.path().join("must-not-restore.pmvault");
+    let state = app.recovery.as_mut().unwrap();
+    state.source = source.display().to_string();
+    state.destination = destination.display().to_string();
+    *state.password = "gui-synthetic-master-only".into();
+    let generation = state.generation;
+    revoke_monitor_at_admission(&app, registration);
+    let rejected = app.update(Message::RestoreRecoveryCopy(generation));
+    assert!(
+        !app.operations
+            .authority
+            .snapshot(std::time::Instant::now())
+            .monitor_ready,
+        "the admission barrier must revoke native authority"
+    );
+    let state = app.recovery.as_ref().unwrap();
+    assert!(
+        state.password.is_empty(),
+        "racing monitor rejection must retire recovery input without a UI failure event"
+    );
+    assert_eq!(state.source, source.display().to_string());
+    assert_eq!(state.destination, destination.display().to_string());
+    assert_eq!(std::fs::read(&source).unwrap(), original);
+    assert!(!destination.exists());
+    assert!(app.session.is_none() && app.operations.active.is_none());
+    tests::drain_task(&mut app, rejected);
+    assert!(
+        app.operations
+            .authority
+            .snapshot(std::time::Instant::now())
+            .fully_locked
+    );
+}
+
+#[test]
+fn busy_and_picker_rejections_preserve_inputs_even_with_unready_monitor() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (_dir, mut app) = tests::fixture(0);
+    app.test_update(Message::Lock);
+    require_unready_monitor(&mut app);
+    app.test_update(Message::OpenRecovery);
+    app.master_password = "pending-auth".into();
+    app.confirm_password = "pending-confirmation".into();
+    *app.recovery.as_mut().unwrap().password = "pending-recovery".into();
+    let generation = app.recovery.as_ref().unwrap().generation;
+    let assert_inputs = |app: &App| {
+        assert_eq!(app.master_password, "pending-auth");
+        assert_eq!(app.confirm_password, "pending-confirmation");
+        assert_eq!(
+            &**app.recovery.as_ref().unwrap().password,
+            "pending-recovery"
+        );
+    };
+    let _ = app.begin_picker(picker::Purpose::RecoverySource);
+    let picker = app.picker_pending.unwrap().id;
+    for message in [
+        Message::CreateVault,
+        Message::OpenVault,
+        Message::RestoreRecoveryCopy(generation),
+    ] {
+        app.test_update(message);
+        assert_inputs(&app);
+    }
+    app.test_update(Message::PathPicked(picker, Ok(None)));
+
+    let (arrived_tx, arrived_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    app.operations
+        .service
+        .as_ref()
+        .unwrap()
+        .before_result_ready_for_test(move || {
+            arrived_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+    app.start_inspection(false);
+    let inspection = app.operations.task.take().unwrap();
+    arrived_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    for message in [
+        Message::CreateVault,
+        Message::OpenVault,
+        Message::RestoreRecoveryCopy(generation),
+    ] {
+        drop(app.update(message));
+        assert_inputs(&app);
+    }
+    release_tx.send(()).unwrap();
+    tests::drain_task(&mut app, inspection);
+}
+
+#[test]
+fn unready_native_monitor_retires_auth_passwords_and_allows_first_ready_retry() {
+    for create in [false, true] {
+        let (dir, mut app) = tests::fixture(0);
+        app.test_update(Message::Lock);
+        let registration = require_unready_monitor(&mut app);
+        if create {
+            app.vault_path = dir.path().join("new.pmvault").display().to_string();
+        }
+        let original = std::fs::read(&app.vault_path).ok();
+        app.master_password = "gui-synthetic-master-only".into();
+        app.confirm_password = "gui-synthetic-master-only".into();
+        let message = || {
+            if create {
+                Message::CreateVault
+            } else {
+                Message::OpenVault
+            }
+        };
+        app.test_update(message());
+        assert!(
+            app.master_password.is_empty(),
+            "rejected auth must retire its password"
+        );
+        assert!(app.confirm_password.is_empty());
+        assert!(app.session.is_none() && app.operations.active.is_none());
+        assert_eq!(std::fs::read(&app.vault_path).ok(), original);
+        assert!(
+            !app.operations
+                .authority
+                .snapshot(std::time::Instant::now())
+                .monitor_ready
+        );
+        assert!(app.status.contains("监控"));
+
+        assert!(app.operations.authority.monitor_ready_for(registration));
+        app.test_update(Message::PlatformSecurity(SecurityEvent::MonitorReady));
+        app.master_password = "gui-synthetic-master-only".into();
+        app.confirm_password = "gui-synthetic-master-only".into();
+        app.test_update(message());
+        assert!(
+            app.session.is_some(),
+            "a genuine first Ready must still allow fresh auth"
+        );
+    }
+}
+
+#[test]
+fn unready_native_monitor_retires_only_current_recovery_password_before_retry() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let (dir, mut app) = tests::fixture(0);
+    let source = std::path::PathBuf::from(&app.vault_path);
+    let original = std::fs::read(&source).unwrap();
+    let destination = dir.path().join("recovered.pmvault");
+    app.test_update(Message::Lock);
+    let registration = require_unready_monitor(&mut app);
+    app.test_update(Message::OpenRecovery);
+    let state = app.recovery.as_mut().unwrap();
+    state.source = source.display().to_string();
+    state.destination = destination.display().to_string();
+    *state.password = "gui-synthetic-master-only".into();
+    let generation = state.generation;
+
+    app.test_update(Message::RestoreRecoveryCopy(generation.wrapping_sub(1)));
+    assert_eq!(
+        &**app.recovery.as_ref().unwrap().password,
+        "gui-synthetic-master-only"
+    );
+    assert!(
+        !app.operation_busy(),
+        "a stale submit cannot retire the current form"
+    );
+
+    let (arrived_tx, arrived_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    app.operations
+        .service
+        .as_ref()
+        .unwrap()
+        .before_result_ready_for_test(move || {
+            arrived_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+    let rejected = app.update(Message::RestoreRecoveryCopy(generation));
+    assert!(
+        app.recovery.as_ref().unwrap().password.is_empty(),
+        "rejected recovery must detach its current password"
+    );
+    arrived_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("password retirement reaches the real worker");
+    assert!(
+        app.operations.active.is_none(),
+        "no restore/KDF operation was admitted"
+    );
+    assert!(
+        !app.operations
+            .authority
+            .snapshot(Instant::now())
+            .fully_locked,
+        "retirement must wait for the real worker"
+    );
+    assert!(!destination.exists());
+    assert_eq!(std::fs::read(&source).unwrap(), original);
+    release_tx.send(()).unwrap();
+    tests::drain_task(&mut app, rejected);
+    let state = app.recovery.as_ref().unwrap();
+    assert_eq!(state.generation, generation);
+    assert_eq!(state.source, source.display().to_string());
+    assert_eq!(state.destination, destination.display().to_string());
+    assert!(app.status.contains("监控"));
+    assert!(
+        !app.operations
+            .authority
+            .snapshot(Instant::now())
+            .monitor_ready
+    );
+
+    assert!(app.operations.authority.monitor_ready_for(registration));
+    app.test_update(Message::PlatformSecurity(SecurityEvent::MonitorReady));
+    *app.recovery.as_mut().unwrap().password = "gui-synthetic-master-only".into();
+    app.test_update(Message::RestoreRecoveryCopy(generation));
+    assert!(
+        destination.exists(),
+        "first native Ready allows an explicit fresh retry"
+    );
+    assert_eq!(std::fs::read(&source).unwrap(), original);
+    assert!(VaultSession::open(&destination, "gui-synthetic-master-only").is_ok());
+}
+
 #[test]
 fn create_submission_returns_observer_and_leases_owned_inputs() {
     let dir = tempfile::tempdir().unwrap();
@@ -196,6 +601,8 @@ fn stored_result_before_ready_cannot_be_irreversibly_consumed_by_tick() {
         let (_dir, mut app) = tests::fixture(1);
         if opening {
             app.test_update(Message::Lock);
+            // This test models reopening after an already-ready native monitor.
+            app.security_monitor_ready = true;
             app.master_password = "gui-synthetic-master-only".into();
         }
         let (tx, rx) = mpsc::channel();
@@ -567,6 +974,9 @@ fn real_dispose_drain_before_its_ui_signal_does_not_poison_fresh_auth_or_inspect
     use std::time::{Duration, Instant};
     for opening in [false, true] {
         let (_dir, mut app) = tests::fixture(1);
+        // The fixture installs a session directly; model its ready UI monitor
+        // explicitly before testing the independent Dispose notification race.
+        app.security_monitor_ready = true;
         let (arrived_tx, arrived_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         app.operations

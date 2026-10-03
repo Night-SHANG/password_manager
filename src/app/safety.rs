@@ -28,7 +28,15 @@ impl App {
     }
 
     pub(super) fn ensure_monitor_ready(&mut self, required: bool) -> bool {
-        if !required || self.security_monitor_ready {
+        // The displayed Ready can lag a native failure. It may delay admission,
+        // but only the coordinator's bound monitor can authorize it.
+        if (!required || self.security_monitor_ready)
+            && self
+                .operations
+                .authority
+                .snapshot(Instant::now())
+                .monitor_ready
+        {
             return true;
         }
         self.status = if self.security_monitor_failed {
@@ -72,12 +80,23 @@ impl App {
             let _ = service.drain_snapshot();
         }
         let snapshot = self.operations.authority.snapshot(now);
-        if snapshot.masked
-            && !matches!(
-                self.operations.session,
-                operations::SessionUi::Locking | operations::SessionUi::Locked
-            )
-        {
+        let needs_detachment = match self.operations.session {
+            operations::SessionUi::Locking => {
+                // A second native startup retry can revoke a newer epoch while
+                // the first cleanup is held. Revisit it only after actual drain,
+                // with no failed handoff still owning materials in the UI.
+                !snapshot.fully_locked
+                    && snapshot.occupied.is_none()
+                    && self.operations.launch_retired.is_none()
+                    && self.operations.failed_input.is_none()
+            }
+            operations::SessionUi::Locked => !snapshot.fully_locked,
+            _ => true,
+        };
+        if snapshot.masked && needs_detachment {
+            // A native startup retry can revoke while the UI is already locked
+            // and send only its later first Ready. That old context still needs
+            // real detachment and worker cleanup before fresh auth can resume.
             self.mask_for_operation_lock("安全权限已撤销", false);
         }
         // Durable polling also recovers lost/coalesced UI transport notifications.

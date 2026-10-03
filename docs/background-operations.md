@@ -160,8 +160,9 @@ remain required.
 
 ## Finite remaining v1 work
 
-Finish exact-revision CI and native acceptance, and resolve the separately
-recorded large-field editor decision without silently changing accepted limits.
+Finish exact-revision CI and native acceptance. Segmented editing for oversized
+notes has been approved as a separate follow-on: preserve complete data and the
+existing format, leave ordinary notes unchanged, and do not lower accepted limits.
 Reveal/Copy/Edit decryption remains synchronous and requires an explicit follow-on
 ownership change if it is moved onto the existing lane. Then implement the
 separately planned same-DEK master-password change. Preserve the existing finite
@@ -184,3 +185,40 @@ reported that background materials had been released; normal window close then
 completed. These were native functional observations on Linux, not timed
 Windows or IME/DPI acceptance. Tab did not traverse from search to buttons in
 this check and remains part of the outstanding keyboard-interaction work.
+
+
+## CI39 monitor-admission correction
+
+Development commit `f4bcee7467dad1d65f841fb50f8f71a2511e3d1b` passed
+all 34 Windows headless GUI tests in Preflight #39. Lock-inputs, secret scan,
+and dependency policy also passed. The ordinary Windows library suite stopped
+at three failures, so packaging and its downstream gates did not run.
+
+Two failures came from synthetic open fixtures that initialized the backend as
+ready without initializing the Windows UI readiness precondition. The fixtures
+now express both conditions. The third exposed a real regression: recovery's
+monitor-unready return retained the submitted password in the form. Current
+recovery-generation and authentication inputs now transfer to the existing
+zeroizing retirement lane when readiness rejects submission. File paths and
+recovery listings remain available for retry; stale generations cannot clear
+another form's password.
+
+Admission also rechecks authoritative readiness after a failed admission, covering
+native revocation between the initial UI check and the coordinator decision.
+Displayed readiness cannot override backend revocation. Initial startup retry and
+a second permitted retry during held cleanup now detach their real UI owners and
+wait for actual worker drain before fresh explicit authentication can proceed.
+The correction does not manufacture readiness, cleanup witnesses, or successful
+adoption, and does not change native registration or runner authority.
+
+Regression models cover the rejected-admission interleaving, both startup retry
+schedules, real held cleanup, stale input, delayed Ready, and Busy/picker input
+preservation. Windows screen-capture effects are disabled only in the synthetic
+startup model, which has no native window responder; application defaults remain
+unchanged. Independent review found no remaining blocker in the bounded repair.
+The final Linux repair passed formatting, all-target compilation, strict
+all-target/all-feature Clippy, 432 ordinary tests (376 library and 56 integration;
+50 intentionally ignored), all 34 headless GUI tests, and the release build plus
+executable self-test. Exact-revision Windows results remain a separate gate. These state models and
+headless pixels do not establish Windows 10 native monitor, focus, suspend,
+clipboard, IME, or DPI acceptance.
