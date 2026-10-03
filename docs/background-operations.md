@@ -222,3 +222,20 @@ all-target/all-feature Clippy, 432 ordinary tests (376 library and 56 integratio
 executable self-test. Exact-revision Windows results remain a separate gate. These state models and
 headless pixels do not establish Windows 10 native monitor, focus, suspend,
 clipboard, IME, or DPI acceptance.
+
+
+### Windows source-guard newline correction
+
+Preflight #40 passed all 368 Windows library tests and all 34 GUI tests, including
+the monitor-admission corrections. Two subsequent architecture guards failed
+because their literal LF delimiters did not match CRLF source checkout bytes;
+the checks scanned past the intended Message item or into synchronous test
+fixtures. No package was produced by that run.
+
+The test-only correction normalizes CRLF before extraction and requires unique,
+known boundaries. Eight targeted checks cover safe and forbidden production or
+Message content under both newline forms, plus missing and ambiguous boundaries.
+The original forbidden calls, owned-message types, submission/adoption checks,
+and cleanup-witness prohibition are retained. This remains a narrow source guard,
+not a Rust parser or a substitute for actual worker lifecycle tests. Production
+code, dependencies, and executable behavior are unchanged from #40.
