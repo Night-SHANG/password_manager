@@ -2,8 +2,10 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 
 use crate::import::{
-    ImportBatch, ImportParseResult, NormalizedImportItem, content_fingerprint, read_source_file,
+    ImportBatch, ImportParseResult, NormalizedImportItem, content_fingerprint,
+    read_source_file_with, work_to_result,
 };
+use crate::operations::WorkResult;
 use crate::security::sha256;
 use crate::{AppError, Result};
 
@@ -110,9 +112,15 @@ impl Mapping {
 }
 
 pub fn parse_path(path: &Path) -> Result<ImportBatch> {
-    let bytes = read_source_file(path)?;
-    let parsed = parse_reader(Cursor::new(&bytes))?;
+    work_to_result(parse_path_with(path, &mut || Ok(())))
+}
 
+pub(super) fn parse_path_with(
+    path: &Path,
+    checkpoint: &mut impl FnMut() -> WorkResult<()>,
+) -> WorkResult<ImportBatch> {
+    let bytes = read_source_file_with(path, checkpoint)?;
+    let parsed = parse_reader_with(Cursor::new(&*bytes), checkpoint)?;
     Ok(ImportBatch {
         provider: parsed.provider,
         source_digest: sha256(&bytes),
@@ -122,15 +130,23 @@ pub fn parse_path(path: &Path) -> Result<ImportBatch> {
 }
 
 pub fn parse_reader<R: Read>(reader: R) -> Result<ImportParseResult> {
+    work_to_result(parse_reader_with(reader, &mut || Ok(())))
+}
+
+fn parse_reader_with<R: Read>(
+    reader: R,
+    checkpoint: &mut impl FnMut() -> WorkResult<()>,
+) -> WorkResult<ImportParseResult> {
+    checkpoint()?;
     let mut csv = csv::ReaderBuilder::new().flexible(true).from_reader(reader);
-    let headers = csv.headers()?.clone();
+    let headers = csv
+        .headers()
+        .map_err(|_| AppError::Input("CSV 表头无法解析".into()))?
+        .clone();
     let mapping = Mapping::from_headers(&headers);
 
     if !mapping.looks_like_password_export() {
-        return Err(AppError::Input(format!(
-            "无法识别为密码 CSV，表头：{}",
-            headers.iter().collect::<Vec<_>>().join(", ")
-        )));
+        return Err(AppError::Input("无法识别为密码 CSV".into()).into());
     }
 
     let provider = provider_from_headers(&headers).to_string();
@@ -140,6 +156,7 @@ pub fn parse_reader<R: Read>(reader: R) -> Result<ImportParseResult> {
     };
 
     for row in csv.records() {
+        checkpoint()?;
         let row = match row {
             Ok(row) => row,
             Err(_) => {
@@ -290,5 +307,11 @@ mod tests {
         let parsed = parse_reader(csv.as_bytes()).unwrap();
         assert_eq!(parsed.items[0].password, "  pass  ");
         assert_eq!(parsed.items[0].notes, "  note  ");
+    }
+    #[test]
+    fn controlled_import_csv_header_error_is_redacted() {
+        let error = parse_reader(b"synthetic-secret-header,password\nvalue,secret\n".as_slice())
+            .unwrap_err();
+        assert!(!error.to_string().contains("synthetic-secret-header"));
     }
 }

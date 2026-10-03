@@ -1,6 +1,17 @@
 use super::*;
 use crate::domain::EntryDraft;
 thread_local! { static AFTER_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None); }
+pub(crate) type WorkerAfterCreate = Box<dyn FnOnce() + Send>;
+thread_local! { static WORKER_AFTER_CREATE: std::cell::RefCell<Option<WorkerAfterCreate>> = std::cell::RefCell::new(None); }
+pub(crate) fn set_worker_after_create(hook: impl FnOnce() + Send + 'static) {
+    WORKER_AFTER_CREATE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+pub(crate) fn take_worker_after_create() -> Option<WorkerAfterCreate> {
+    WORKER_AFTER_CREATE.with(|slot| slot.borrow_mut().take())
+}
+pub(crate) fn install_worker_after_create(hook: Option<WorkerAfterCreate>) {
+    AFTER_CREATE.with(|slot| *slot.borrow_mut() = hook.map(|hook| hook as Box<dyn FnOnce()>));
+}
 pub(super) fn run_after_create() {
     if let Some(f) = AFTER_CREATE.with(|slot| slot.borrow_mut().take()) {
         f();
@@ -991,10 +1002,6 @@ fn forced_exit_after_prefix_can_leave_plaintext_and_never_cleans_competitor() {
         b"competitor sentinel"
     );
     assert!(dir.path().join("forced.moved").exists());
-}
-
-pub(crate) fn set_after_create(hook: impl FnOnce() + 'static) {
-    AFTER_CREATE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 #[cfg(target_os = "linux")]

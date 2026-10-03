@@ -157,15 +157,38 @@ impl App {
                 form = form
                     .push(text("跳过只忽略当前来源行；其他行仍可能更新同一本地条目。").size(12));
             }
-            let mut unresolved = 0;
-            for (index, row) in preview.rows().iter().enumerate() {
+            // Summary, displayed-row positions and initial decision count
+            // were prepared off-thread. Only one ordinary page becomes widgets.
+            let unresolved = preview
+                .unresolved_count()
+                .saturating_sub(state.resolutions.len());
+            form=form.push(text("Ctrl + PageUp / PageDown 翻行；Ctrl + Shift + ↑ / ↓ 选候选目标行；Ctrl + Shift + PageUp / PageDown 翻该行候选").size(11));
+            let focused = self.focused_candidate_row();
+            let displayed = preview.display_rows();
+            let (page, range) = page_range(displayed.len(), self.import_page, IMPORT_PAGE_SIZE);
+            if !displayed.is_empty() {
+                form = form
+                    .push(
+                        text(format!(
+                            "待检查 {} 行 · 当前 {}–{} 行",
+                            displayed.len(),
+                            range.start + 1,
+                            range.end
+                        ))
+                        .size(12),
+                    )
+                    .push(page_controls(
+                        displayed.len(),
+                        page,
+                        IMPORT_PAGE_SIZE,
+                        move |page| Message::SetImportPage(preview_id, page),
+                    ));
+            }
+            for &index in &displayed[range] {
+                let row = &preview.rows()[index];
                 match row.class() {
-                    ImportClass::Conflict { existing_ids }
-                    | ImportClass::LocallyDeleted { existing_ids } => {
+                    ImportClass::Conflict { .. } | ImportClass::LocallyDeleted { .. } => {
                         let choice = state.resolutions.get(&index);
-                        if choice.is_none() {
-                            unresolved += 1;
-                        }
                         let mut decision = column![
                             text(format!(
                                 "{}：{} · {}",
@@ -204,31 +227,70 @@ impl App {
                             .spacing(8),
                         ]
                         .spacing(8);
-                        for id in existing_ids {
-                            if let Some(entry) = session.entry(*id)
-                                && preview
-                                    .allows_resolution(index, &ConflictResolution::UseImported(*id))
+                        if focused == Some(index) {
+                            decision = decision.push(text("键盘候选目标行").size(11));
+                        }
+                        let candidates = row.resolution_candidate_ids();
+                        let (candidate_page, candidate_range) = page_range(
+                            candidates.len(),
+                            state.candidate_pages.get(&index).copied().unwrap_or(0),
+                            CANDIDATE_PAGE_SIZE,
+                        );
+                        if !candidates.is_empty() {
+                            decision = decision.push(
+                                text(format!(
+                                    "可覆盖 / 恢复 {} 个本地候选 · 当前 {}–{} 个",
+                                    candidates.len(),
+                                    candidate_range.start + 1,
+                                    candidate_range.end
+                                ))
+                                .size(12),
+                            );
+                        }
+                        if candidates.len() > CANDIDATE_PAGE_SIZE {
+                            decision = decision.push(page_controls(
+                                candidates.len(),
+                                candidate_page,
+                                CANDIDATE_PAGE_SIZE,
+                                move |page| {
+                                    Message::SetImportCandidatePage(preview_id, index, page)
+                                },
+                            ));
+                        }
+                        for id in &candidates[candidate_range] {
+                            if let Some(entry) = match self.view_index.as_ref() {
+                                Some(lookup) => lookup.entry(session, *id),
+                                None => session.entry(*id),
+                            } && preview
+                                .allows_resolution(index, &ConflictResolution::UseImported(*id))
                             {
                                 let selected = matches!(choice, Some(ConflictResolution::UseImported(selected)) if selected == id);
                                 decision = decision.push(
-                                    button(text(format!(
-                                        "{}使用导入值覆盖 / 恢复：{}",
-                                        if selected { "已选：" } else { "" },
-                                        entry.name
-                                    )))
-                                    .on_press(Message::SetImportResolution(
-                                        preview_id,
-                                        index,
-                                        ConflictResolution::UseImported(*id),
-                                    ))
-                                    .style(button::secondary),
+                                    container(
+                                        button(text(format!(
+                                            "{}使用导入值覆盖 / 恢复：{}",
+                                            if selected { "已选：" } else { "" },
+                                            entry.name
+                                        )))
+                                        .on_press(Message::SetImportResolution(
+                                            preview_id,
+                                            index,
+                                            ConflictResolution::UseImported(*id),
+                                        ))
+                                        .style(button::secondary),
+                                    )
+                                    .id(format!("import-candidate-{index}-{id}")),
                                 );
                             }
                         }
-                        form = form.push(card(decision));
+                        form =
+                            form.push(container(card(decision)).id(format!("import-row-{index}")));
                     }
                     ImportClass::UpdateCandidate { .. } => {
-                        form = form.push(text(format!("更新候选：{}", row.item().name)).size(13))
+                        form = form.push(
+                            container(text(format!("更新候选：{}", row.item().name)).size(13))
+                                .id(format!("import-row-{index}")),
+                        )
                     }
                     _ => {}
                 }
@@ -281,7 +343,9 @@ impl App {
                 checkbox(state.confirm_plaintext).label("我理解导出文件中的密码和备注没有加密").on_toggle(Message::ConfirmPlaintextChanged),
                 button("导出明文 CSV").on_press_maybe((state.confirm_plaintext && self.picker_pending.is_none() && self.export_notice.is_none()).then_some(Message::ExportPlaintextCsv)).style(button::danger),
             ].spacing(12)),
-            text(format!("版本 {} · 条目 {} · Revision {}", env!("CARGO_PKG_VERSION"), session.active_entries().count(), session.revision())).size(12),
+            text(format!("版本 {} · 条目 {} · Revision {}", env!("CARGO_PKG_VERSION"),
+                self.view_index.as_ref().map_or_else(||session.active_entries().count(),view_index::ViewIndex::active_count),
+                session.revision())).size(12),
             text(format!("保险库：{}", session.path().display())).size(12),
         ].spacing(16);
         self.workspace("设置 / 导出 / 备份", form)

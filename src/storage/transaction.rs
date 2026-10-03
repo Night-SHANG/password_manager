@@ -594,6 +594,25 @@ pub(crate) fn set_hook(point: Point, hook: impl FnOnce() -> Result<()> + 'static
     HOOK.with(|slot| *slot.borrow_mut() = Some((point, Box::new(hook))));
 }
 #[cfg(test)]
+pub(crate) type WorkerTestHook = (Point, Box<dyn FnOnce() -> Result<()> + Send>);
+#[cfg(test)]
+thread_local! { static WORKER_HOOK: std::cell::RefCell<Option<WorkerTestHook>> = std::cell::RefCell::new(None); }
+#[cfg(test)]
+pub(crate) fn set_worker_hook(point: Point, hook: impl FnOnce() -> Result<()> + Send + 'static) {
+    WORKER_HOOK.with(|slot| *slot.borrow_mut() = Some((point, Box::new(hook))));
+}
+#[cfg(test)]
+pub(crate) fn take_worker_hook() -> Option<WorkerTestHook> {
+    WORKER_HOOK.with(|slot| slot.borrow_mut().take())
+}
+#[cfg(test)]
+pub(crate) fn install_worker_hook(hook: Option<WorkerTestHook>) {
+    HOOK.with(|slot| {
+        *slot.borrow_mut() =
+            hook.map(|(point, hook)| (point, hook as Box<dyn FnOnce() -> Result<()>>))
+    });
+}
+#[cfg(test)]
 pub(crate) fn test_hook(point: Point) -> Result<()> {
     let hook = HOOK.with(|slot| {
         let mut slot = slot.borrow_mut();

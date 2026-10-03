@@ -2,6 +2,186 @@ use super::*;
 use crate::domain::EntryDraft;
 use iced_test::{Simulator, selector};
 
+/// Runtime effects are retained so deferred close and clipboard actions are
+/// asserted on their actual variants, rather than Task's admission unit count.
+pub(super) struct TestEffects {
+    pub(super) actions: Vec<iced_test::runtime::Action<Message>>,
+}
+impl TestEffects {
+    pub(super) fn units(&self) -> usize {
+        self.actions.len()
+    }
+    pub(super) fn closes(&self, window: iced::window::Id) -> bool {
+        self.actions.iter().any(|action| matches!(action,
+            iced_test::runtime::Action::Window(iced_test::runtime::window::Action::Close(id)) if *id == window
+        ))
+    }
+}
+
+/// Keep the real completion observer alive, dispatch metadata back through the
+/// real update path, and wait for the worker's Drained acknowledgement. Follow-up
+/// disposal and clipboard-shutdown tasks join the same deterministic event loop.
+pub(super) fn drain_task(app: &mut App, task: Task<Message>) -> TestEffects {
+    use iced::futures::{StreamExt, stream::SelectAll};
+    use iced_test::runtime::{Action, task::into_stream};
+    let mut effects = TestEffects {
+        actions: Vec::new(),
+    };
+    let mut streams = SelectAll::new();
+    if let Some(stream) = into_stream(task) {
+        streams.push(stream);
+    }
+    iced::futures::executor::block_on(async {
+        while let Some(action) = streams.next().await {
+            match action {
+                Action::Output(message) => {
+                    if let Some(stream) = into_stream(app.update(message)) {
+                        streams.push(stream);
+                    }
+                }
+                action => effects.actions.push(action),
+            }
+        }
+    });
+    effects
+}
+
+impl App {
+    pub(super) fn test_update(&mut self, message: Message) -> TestEffects {
+        use iced::futures::{FutureExt, StreamExt};
+        use iced_test::runtime::{Action, task::into_stream};
+        let native_picker = matches!(test_message(&message), Message::PickPath(_));
+        let task = self.update(message);
+        let worker_or_shutdown = self.operations.active.is_some()
+            || self
+                .operations
+                .authority
+                .snapshot(std::time::Instant::now())
+                .occupied
+                .is_some()
+            || matches!(self.operations.session, operations::SessionUi::Locking)
+            || self.operations.shutdown_started;
+        if worker_or_shutdown && !native_picker {
+            return drain_task(self, task);
+        }
+        // Native window/clipboard requests need a GUI responder. Preserve their
+        // immediate effects, but leave native picker completions under each
+        // test's explicit PathPicked injection instead of launching an OS dialog.
+        let mut effects = TestEffects {
+            actions: Vec::new(),
+        };
+        if let Some(mut stream) = into_stream(task) {
+            while let Some(Some(action)) = stream.next().now_or_never() {
+                match action {
+                    Action::Output(message) => {
+                        effects.actions.extend(self.test_update(message).actions);
+                    }
+                    action => effects.actions.push(action),
+                }
+            }
+        }
+        effects
+    }
+
+    pub(super) fn test_drain_pending(&mut self) -> TestEffects {
+        let task = self.operations.task.take().unwrap_or_else(Task::none);
+        drain_task(self, task)
+    }
+
+    /// Only fixture setup that intentionally saves outside App may synchronize
+    /// its revised binding. Never call this from the event-loop helper: stale
+    /// binding rejection must remain observable in real update regressions.
+    pub(super) fn test_sync_fixture_binding(&self) {
+        let snapshot = self
+            .operations
+            .authority
+            .snapshot(std::time::Instant::now());
+        assert!(!snapshot.masked && !snapshot.closing);
+        assert!(snapshot.occupied.is_none() && self.operations.active.is_none());
+        let deadline = snapshot
+            .live
+            .expect("fixture has a real live session")
+            .deadline;
+        let binding = self
+            .session
+            .as_ref()
+            .expect("fixture session is present")
+            .operation_binding();
+        self.operations
+            .authority
+            .activate_session(binding, deadline);
+        assert_eq!(
+            self.operations
+                .authority
+                .snapshot(std::time::Instant::now())
+                .live
+                .unwrap()
+                .deadline,
+            deadline,
+            "fixture synchronization must not extend the idle deadline"
+        );
+    }
+
+    /// Explicit clock setup models a real already-unlocked session deadline;
+    /// changing last_activity alone no longer changes the worker's authority.
+    pub(super) fn test_set_fixture_clock(&mut self, last_activity: std::time::Instant) {
+        let snapshot = self
+            .operations
+            .authority
+            .snapshot(std::time::Instant::now());
+        assert!(!snapshot.masked && !snapshot.closing);
+        assert!(snapshot.occupied.is_none() && self.operations.active.is_none());
+        let live = snapshot.live.expect("fixture has a real live session");
+        assert_eq!(Some(live.binding), snapshot.stamp.session);
+        assert_eq!(
+            live.binding,
+            self.session.as_ref().unwrap().operation_binding(),
+            "clock setup must not synchronize a changed session binding"
+        );
+        self.last_activity = last_activity;
+        self.operations.authority.activate_session(
+            live.binding,
+            last_activity + std::time::Duration::from_secs(u64::from(self.idle_minutes) * 60),
+        );
+    }
+
+    pub(super) fn test_lock_with_status(&mut self, status: &str) {
+        self.lock_with_status(status);
+        self.test_drain_pending();
+    }
+
+    pub(super) fn test_open_recovery(&mut self) {
+        self.open_recovery();
+        self.test_drain_pending();
+    }
+}
+
+/// Pattern-match UI events without discarding the stamp used by App::update.
+fn test_message(mut message: &Message) -> &Message {
+    while let Message::Ui(_, inner) = message {
+        message = inner;
+    }
+    message
+}
+
+#[test]
+fn test_runtime_drain_preserves_deferred_close_action() {
+    let (_dir, mut app) = fixture(0);
+    let window = iced::window::Id::unique();
+    let task = app.update(Message::CloseRequested(window));
+    assert!(
+        app.session.is_none(),
+        "close masks before cleanup completes"
+    );
+    let effects = drain_task(&mut app, task);
+    assert!(
+        effects.closes(window),
+        "close must finish real worker and clipboard cleanup"
+    );
+    assert_eq!(effects.units(), 1, "close is issued exactly once");
+    assert!(app.closing);
+}
+
 const SIZES: [(f32, f32); 3] = [(960.0, 640.0), (1280.0, 800.0), (1600.0, 900.0)];
 
 pub(super) fn fixture(count: usize) -> (tempfile::TempDir, App) {
@@ -41,7 +221,7 @@ fn simulator(app: &App, size: (f32, f32)) -> Simulator<'_, Message> {
 fn apply_messages(app: &mut App, messages: Vec<Message>) {
     assert!(!messages.is_empty(), "click did not emit a message");
     for message in messages {
-        let _ = app.update(message);
+        let _ = app.test_update(message);
     }
 }
 
@@ -122,12 +302,13 @@ fn message_debug_never_contains_secret_payloads() {
 #[test]
 fn category_delete_moves_entries_without_deleting_credentials() {
     let (_dir, mut app) = fixture(1);
-    let _ = app.update(Message::CategoryNameChanged("工作".to_string()));
-    let _ = app.update(Message::AddCategory);
+    let _ = app.test_update(Message::CategoryNameChanged("工作".to_string()));
+    let _ = app.test_update(Message::AddCategory);
     app.session.as_mut().unwrap().body_mut().entries[0].category = "工作".to_string();
     app.session.as_mut().unwrap().save().unwrap();
-    let _ = app.update(Message::RequestDeleteCategory("工作".to_string()));
-    let _ = app.update(Message::ConfirmDeleteCategory("工作".to_string()));
+    app.test_sync_fixture_binding();
+    let _ = app.test_update(Message::RequestDeleteCategory("工作".to_string()));
+    let _ = app.test_update(Message::ConfirmDeleteCategory("工作".to_string()));
     let vault = app.session.as_ref().unwrap();
     assert_eq!(vault.entries().len(), 1);
     assert_eq!(vault.entries()[0].category, "其他");
@@ -138,11 +319,11 @@ fn category_delete_moves_entries_without_deleting_credentials() {
 #[test]
 fn lock_drops_editor_import_preview_and_revealed_state() {
     let (_dir, mut app) = fixture(1);
-    let _ = app.update(Message::NewEntry);
-    let _ = app.update(Message::EditorPasswordChanged(
+    let _ = app.test_update(Message::NewEntry);
+    let _ = app.test_update(Message::EditorPasswordChanged(
         "synthetic-buffer".to_string(),
     ));
-    let _ = app.update(Message::Lock);
+    let _ = app.test_update(Message::Lock);
     assert!(app.session.is_none());
     assert!(matches!(app.panel, Panel::Vault));
     assert!(app.revealed.is_none());
@@ -161,8 +342,8 @@ fn card_action_targets_its_id_and_rejects_stale_targets() {
         .iter()
         .map(|e| e.id)
         .collect();
-    let _ = app.update(Message::SelectEntry(ids[0]));
-    let _ = app.update(Message::CardAction(ids[1], CardAction::Favorite));
+    let _ = app.test_update(Message::SelectEntry(ids[0]));
+    let _ = app.test_update(Message::CardAction(ids[1], CardAction::Favorite));
     assert_eq!(app.selected, Some(ids[1]));
     assert!(
         !app.session
@@ -180,8 +361,8 @@ fn card_action_targets_its_id_and_rejects_stale_targets() {
             .unwrap()
             .favorite
     );
-    let _ = app.update(Message::SearchChanged("does-not-match".to_string()));
-    let _ = app.update(Message::CardAction(ids[1], CardAction::Favorite));
+    let _ = app.test_update(Message::SearchChanged("does-not-match".to_string()));
+    let _ = app.test_update(Message::CardAction(ids[1], CardAction::Favorite));
     assert!(
         app.session
             .as_ref()
@@ -190,8 +371,8 @@ fn card_action_targets_its_id_and_rejects_stale_targets() {
             .unwrap()
             .favorite
     );
-    let _ = app.update(Message::Lock);
-    let _ = app.update(Message::CardAction(ids[1], CardAction::CopyPassword));
+    let _ = app.test_update(Message::Lock);
+    let _ = app.test_update(Message::CardAction(ids[1], CardAction::CopyPassword));
     assert!(app.selected.is_none());
 }
 
@@ -243,7 +424,7 @@ fn gui_cards_search_and_editor_buttons() {
     ] {
         let messages = click_id(&mut app, format!("{suffix}-{}", ids[1]), SIZES[0]);
         assert!(messages.iter().any(|m| {
-            matches!(m, Message::CardAction(id, value) if *id == ids[1] && *value == action)
+            matches!(test_message(m), Message::CardAction(id, value) if *id == ids[1] && *value == action)
         }));
         // Simulator does not execute clipboard tasks; this proves routing only.
     }
@@ -269,13 +450,36 @@ fn gui_cards_search_and_editor_buttons() {
     assert!(simulator(&app, SIZES[1]).find("示例条目 000").is_err());
     click(&mut app, "清空");
     click(&mut app, "+ 添加密码");
-    let _ = app.update(Message::EditorNameChanged("GUI 新条目".to_string()));
-    let _ = app.update(Message::EditorPasswordChanged(
+    let _ = app.test_update(Message::EditorNameChanged("GUI 新条目".to_string()));
+    let _ = app.test_update(Message::EditorPasswordChanged(
         "synthetic-gui-only".to_string(),
     ));
     click(&mut app, "保存条目");
     assert!(matches!(&app.panel, Panel::Vault));
     assert_eq!(app.session.as_ref().unwrap().active_entries().count(), 4);
+    assert_eq!(app.view_index.as_ref().unwrap().active_count(), 4);
+    assert!(simulator(&app, SIZES[1]).find("GUI 新条目").is_ok());
+    let created_id = app
+        .session
+        .as_ref()
+        .unwrap()
+        .entries()
+        .iter()
+        .find(|entry| entry.name == "GUI 新条目")
+        .unwrap()
+        .id;
+    // Real edit/save must replace worker-prepared search metadata too. Merely
+    // mutating the session while retaining its old index fails this lookup.
+    app.test_update(Message::EditEntry(created_id));
+    app.test_update(Message::EditorNameChanged("GUI 修改后".into()));
+    click(&mut app, "保存条目");
+    app.test_update(Message::SearchChanged("GUI 修改后".into()));
+    assert!(simulator(&app, SIZES[1]).find("GUI 修改后").is_ok());
+    assert!(simulator(&app, SIZES[1]).find("GUI 新条目").is_err());
+    let session = app.session.as_ref().unwrap();
+    let positions = app.card_positions(session);
+    assert_eq!(positions.len(), 1);
+    assert_eq!(session.entries()[positions[0]].id, created_id);
 }
 
 #[test]
@@ -321,14 +525,14 @@ fn gui_settings_page_capture() {
 fn gui_context_and_dark_captures() {
     let (_dir, mut app) = fixture(1);
     let id = app.session.as_ref().unwrap().entries()[0].id;
-    let _ = app.update(Message::ContextEntry(id));
+    let _ = app.test_update(Message::ContextEntry(id));
     capture(&app, "context-actions", SIZES[0]);
     click(&mut app, "显示密码");
     assert!(app.revealed.is_some());
     click(&mut app, "关闭菜单");
     assert!(!app.context_open);
     assert!(app.revealed.is_none());
-    let _ = app.update(Message::DarkModeChanged(true));
+    let _ = app.test_update(Message::DarkModeChanged(true));
     capture(&app, "cards-dark", SIZES[1]);
 }
 
@@ -348,6 +552,9 @@ fn gui_empty_and_long_text_captures() {
             "synthetic-not-a-real-password",
         ))
         .unwrap();
+    // This display fixture intentionally bypasses App's owned mutation lane.
+    // Rebuild its metadata explicitly, as production job completion does.
+    app.view_index = Some(view_index::ViewIndex::build(app.session.as_ref().unwrap()));
     let bounds = simulator(&app, SIZES[0])
         .find(selector::id(format!("card-{id}")))
         .unwrap()
@@ -391,21 +598,21 @@ fn entry_interactions_reject_targets_outside_visible_workspace() {
             match scenario {
                 0 => id = Uuid::new_v4(),
                 1 => {
-                    let _ = app.update(Message::SearchChanged("absent-entry".into()));
+                    let _ = app.test_update(Message::SearchChanged("absent-entry".into()));
                 }
                 2 => {
-                    let _ = app.update(Message::SetNav(NavFilter::Favorites));
+                    let _ = app.test_update(Message::SetNav(NavFilter::Favorites));
                 }
                 3 => {
-                    let _ = app.update(Message::OpenSettings);
+                    let _ = app.test_update(Message::OpenSettings);
                 }
                 4 => {
-                    let _ = app.update(Message::Lock);
+                    let _ = app.test_update(Message::Lock);
                 }
                 _ => unreachable!(),
             }
             let panel = std::mem::discriminant(&app.panel);
-            let _ = app.update(action(id));
+            let _ = app.test_update(action(id));
             assert!(
                 app.selected.is_none(),
                 "invalid target changed selection: {scenario}"
@@ -440,11 +647,11 @@ fn leaving_details_drops_the_revealed_buffer() {
     ] {
         let (_dir, mut app) = fixture(1);
         let id = app.session.as_ref().unwrap().entries()[0].id;
-        let _ = app.update(Message::ContextEntry(id));
-        let _ = app.update(Message::ToggleReveal);
+        let _ = app.test_update(Message::ContextEntry(id));
+        let _ = app.test_update(Message::ToggleReveal);
         assert!(app.revealed.is_some());
         let action_name = format!("{action:?}");
-        let _ = app.update(action);
+        let _ = app.test_update(action);
         assert!(!app.context_open, "details remained open: {action_name}");
         assert!(app.revealed.is_none(), "plaintext retained: {action_name}");
     }
@@ -454,20 +661,20 @@ fn leaving_details_drops_the_revealed_buffer() {
 fn reveal_requires_a_visible_entry_in_open_details() {
     let (_dir, mut app) = fixture(1);
     let id = app.session.as_ref().unwrap().entries()[0].id;
-    let _ = app.update(Message::SelectEntry(id));
-    let _ = app.update(Message::ToggleReveal);
+    let _ = app.test_update(Message::SelectEntry(id));
+    let _ = app.test_update(Message::ToggleReveal);
     assert!(app.revealed.is_none(), "revealed without open details");
-    let _ = app.update(Message::ContextEntry(id));
-    let _ = app.update(Message::ToggleReveal);
+    let _ = app.test_update(Message::ContextEntry(id));
+    let _ = app.test_update(Message::ToggleReveal);
     assert!(app.revealed.is_some());
-    let _ = app.update(Message::CloseContext);
-    let _ = app.update(Message::ToggleReveal);
+    let _ = app.test_update(Message::CloseContext);
+    let _ = app.test_update(Message::ToggleReveal);
     assert!(app.revealed.is_none(), "delayed reveal after close");
-    let _ = app.update(Message::SearchChanged("absent-entry".into()));
-    let _ = app.update(Message::ToggleReveal);
+    let _ = app.test_update(Message::SearchChanged("absent-entry".into()));
+    let _ = app.test_update(Message::ToggleReveal);
     assert!(app.revealed.is_none());
-    let _ = app.update(Message::Lock);
-    let _ = app.update(Message::ToggleReveal);
+    let _ = app.test_update(Message::Lock);
+    let _ = app.test_update(Message::ToggleReveal);
     assert!(app.revealed.is_none());
 }
 
@@ -483,9 +690,9 @@ fn stale_selected_actions_do_not_operate_on_hidden_entries() {
     ] {
         let (_dir, mut app) = fixture(1);
         let id = app.session.as_ref().unwrap().entries()[0].id;
-        let _ = app.update(Message::ContextEntry(id));
-        let _ = app.update(Message::SearchChanged("absent-entry".into()));
-        let task = app.update(action);
+        let _ = app.test_update(Message::ContextEntry(id));
+        let _ = app.test_update(Message::SearchChanged("absent-entry".into()));
+        let task = app.test_update(action);
         assert_eq!(task.units(), 0, "hidden selection emitted a clipboard task");
         assert!(matches!(app.panel, Panel::Vault));
         assert!(app.revealed.is_none());
@@ -516,7 +723,7 @@ fn gui_context_actions_keep_their_original_target() {
         "关闭菜单",
     ] {
         for destination in 0..3 {
-            let _ = app.update(Message::ContextEntry(ids[0]));
+            let _ = app.test_update(Message::ContextEntry(ids[0]));
             let messages = {
                 let mut ui = simulator(&app, SIZES[0]);
                 ui.click(context_button(label)).unwrap();
@@ -527,16 +734,16 @@ fn gui_context_actions_keep_their_original_target() {
                 "context button emitted no message: {label}"
             );
             if destination == 0 {
-                let _ = app.update(Message::ContextEntry(ids[1]));
+                let _ = app.test_update(Message::ContextEntry(ids[1]));
             } else {
-                let _ = app.update(Message::CloseContext);
+                let _ = app.test_update(Message::CloseContext);
                 if destination == 2 {
-                    let _ = app.update(Message::ContextEntry(ids[0]));
+                    let _ = app.test_update(Message::ContextEntry(ids[0]));
                 }
             }
             for message in messages {
                 assert_eq!(
-                    app.update(message).units(),
+                    app.test_update(message).units(),
                     0,
                     "stale action emitted a task: {label}"
                 );
@@ -565,7 +772,7 @@ fn gui_native_picker_entry_points_are_available() {
     let session = app.session.take();
     for size in SIZES {
         for creating in [false, true] {
-            let _ = app.update(Message::AuthMode(creating));
+            let _ = app.test_update(Message::AuthMode(creating));
             app.auth_options_open = true;
             let label = if creating {
                 "选择新建位置"
@@ -581,14 +788,14 @@ fn gui_native_picker_entry_points_are_available() {
             };
             let messages: Vec<_> = ui.into_messages().collect();
             assert!(
-                matches!(messages.first(), Some(Message::PickPath(actual)) if *actual == purpose)
+                matches!(messages.first().map(test_message), Some(Message::PickPath(actual)) if *actual == purpose)
             );
             apply_messages(&mut app, messages);
             assert!(app.picker_pending.is_some());
             let mut ui = simulator(&app, size);
             ui.click(label).unwrap();
             assert_eq!(ui.into_messages().count(), 0);
-            let _ = app.update(Message::PathPicked(app.picker_sequence, Ok(None)));
+            let _ = app.test_update(Message::PathPicked(app.picker_sequence, Ok(None)));
             assert!(app.picker_pending.is_none());
             app.status.clear();
             capture(
@@ -610,7 +817,7 @@ fn gui_native_picker_entry_points_are_available() {
             (picker::Purpose::Restore, "选择恢复文件"),
             (picker::Purpose::Csv, "选择 CSV 导出位置"),
         ] {
-            let _ = app.update(if purpose == picker::Purpose::Import {
+            let _ = app.test_update(if purpose == picker::Purpose::Import {
                 Message::OpenImport
             } else {
                 Message::OpenSettings
@@ -634,7 +841,7 @@ fn gui_native_picker_entry_points_are_available() {
                 ui.into_messages().collect::<Vec<_>>()
             };
             assert!(
-                matches!(messages.first(), Some(Message::PickPath(actual)) if *actual == purpose)
+                matches!(messages.first().map(test_message), Some(Message::PickPath(actual)) if *actual == purpose)
             );
             apply_messages(&mut app, messages);
             assert!(app.picker_pending.is_some());
@@ -647,7 +854,7 @@ fn gui_native_picker_entry_points_are_available() {
                 "pending picker button still enabled"
             );
             // Cancel through the same result message delivered by the native task.
-            let _ = app.update(Message::PathPicked(app.picker_sequence, Ok(None)));
+            let _ = app.test_update(Message::PathPicked(app.picker_sequence, Ok(None)));
             assert!(app.picker_pending.is_none());
         }
     }
@@ -695,7 +902,7 @@ fn gui_picker_path_fields_stay_clear_of_auth_scrollbar() {
 fn gui_safety_settings_are_visible_at_supported_sizes() {
     let (dir, mut app) = fixture(0);
     app.preferences_path = Some(dir.path().join("settings.json"));
-    let _ = app.update(Message::OpenSettings);
+    let _ = app.test_update(Message::OpenSettings);
     for size in SIZES {
         let mut ui = simulator(&app, size);
         for label in ["闲置自动锁定", "密码剪贴板清理"] {
@@ -726,12 +933,12 @@ fn gui_safety_settings_are_visible_at_supported_sizes() {
         ui.simulate(iced_test::simulator::click());
         let messages: Vec<_> = ui.into_messages().collect();
         assert!(matches!(
-            messages.first(),
+            messages.first().map(test_message),
             Some(Message::IdleTimeoutChanged(1))
         ));
         apply_messages(&mut app, messages);
         assert_eq!(app.idle_minutes, 1);
-        let _ = app.update(Message::IdleTimeoutChanged(5));
+        let _ = app.test_update(Message::IdleTimeoutChanged(5));
         let mut ui = simulator(&app, size);
         let bounds = ui
             .click(selector::id("clipboard-timeout-setting"))
@@ -745,12 +952,12 @@ fn gui_safety_settings_are_visible_at_supported_sizes() {
         ui.simulate(iced_test::simulator::click());
         let messages: Vec<_> = ui.into_messages().collect();
         assert!(matches!(
-            messages.first(),
+            messages.first().map(test_message),
             Some(Message::ClipboardTimeoutChanged(15))
         ));
         apply_messages(&mut app, messages);
         assert_eq!(app.clipboard_seconds, 15);
-        let _ = app.update(Message::ClipboardTimeoutChanged(30));
+        let _ = app.test_update(Message::ClipboardTimeoutChanged(30));
     }
 }
 
@@ -758,9 +965,9 @@ fn gui_safety_settings_are_visible_at_supported_sizes() {
 #[ignore = "headless GUI regression"]
 fn gui_editor_password_keyboard_copy_uses_managed_pipeline() {
     let (_dir, mut app) = fixture(0);
-    let _ = app.update(Message::NewEntry);
-    let _ = app.update(Message::EditorPasswordChanged("synthetic-键盘🦀".into()));
-    let _ = app.update(Message::ToggleEditorPasswordVisible(app.context_generation));
+    let _ = app.test_update(Message::NewEntry);
+    let _ = app.test_update(Message::EditorPasswordChanged("synthetic-键盘🦀".into()));
+    let _ = app.test_update(Message::ToggleEditorPasswordVisible(app.context_generation));
     for key in ["c", "x"] {
         let mut ui = simulator(&app, SIZES[0]);
         ui.click(selector::id("editor-password-input")).unwrap();
@@ -778,14 +985,15 @@ fn gui_editor_password_keyboard_copy_uses_managed_pipeline() {
         let messages: Vec<_> = ui.into_messages().collect();
         if key == "x" {
             assert!(
-                !messages
-                    .iter()
-                    .any(|message| matches!(message, Message::EditorPasswordChanged(_))),
+                !messages.iter().any(|message| matches!(
+                    test_message(message),
+                    Message::EditorPasswordChanged(_)
+                )),
                 "cut removed the draft before native copy success"
             );
         }
         assert!(messages.iter().any(|message| {
-            match message {
+            match test_message(message) {
                 Message::CopyEditorPasswordSelection(_, _, cut) if key == "x" => {
                     cut.as_ref().is_some_and(|cut| {
                         cut.original.as_str() == "synthetic-键盘🦀" && cut.replacement.is_empty()
@@ -797,10 +1005,12 @@ fn gui_editor_password_keyboard_copy_uses_managed_pipeline() {
         }));
 
         assert!(
-            messages.iter().any(|message| matches!(message,
-                Message::CopyEditorPasswordSelection(generation, value, _)
-                if *generation == app.context_generation && value.as_str() == "synthetic-键盘🦀"
-            )),
+            messages
+                .iter()
+                .any(|message| matches!(test_message(message),
+                    Message::CopyEditorPasswordSelection(generation, value, _)
+                    if *generation == app.context_generation && value.as_str() == "synthetic-键盘🦀"
+                )),
             "password keyboard copy bypassed managed clipboard"
         );
     }
@@ -810,10 +1020,10 @@ fn gui_editor_password_keyboard_copy_uses_managed_pipeline() {
 #[ignore = "headless GUI regression"]
 fn gui_cleanup_warning_remains_visible_after_lock() {
     let (_dir, mut app) = fixture(0);
-    let _ = app.update(Message::PlatformSecurity(
+    let _ = app.test_update(Message::PlatformSecurity(
         SecurityEvent::ClipboardCleanupFailed,
     ));
-    let _ = app.update(Message::PlatformSecurity(SecurityEvent::SystemSuspending));
+    let _ = app.test_update(Message::PlatformSecurity(SecurityEvent::SystemSuspending));
     capture(&app, "safety-cleanup-warning", SIZES[0]);
     let mut ui = simulator(&app, SIZES[0]);
     let acknowledgement = ui.find("我已手动处理剪贴板").unwrap();
@@ -841,9 +1051,9 @@ fn command_key(ui: &mut Simulator<'_, Message>, key: &str) {
 #[ignore = "headless GUI regression"]
 fn gui_password_cut_batches_preserve_uncopied_draft() {
     let (_dir, mut app) = fixture(0);
-    let _ = app.update(Message::NewEntry);
-    let _ = app.update(Message::EditorPasswordChanged("synthetic-original".into()));
-    let _ = app.update(Message::ToggleEditorPasswordVisible(app.context_generation));
+    let _ = app.test_update(Message::NewEntry);
+    let _ = app.test_update(Message::EditorPasswordChanged("synthetic-original".into()));
+    let _ = app.test_update(Message::ToggleEditorPasswordVisible(app.context_generation));
     for before_cut in [false, true] {
         let mut ui = simulator(&app, SIZES[0]);
         ui.click(selector::id("editor-password-input")).unwrap();
@@ -858,14 +1068,16 @@ fn gui_password_cut_batches_preserve_uncopied_draft() {
         }
         let messages: Vec<_> = ui.into_messages().collect();
         if before_cut {
-            assert!(messages.iter().any(|message| matches!(message,
+            assert!(messages.iter().any(|message| matches!(test_message(message),
                 Message::CopyEditorPasswordSelection(_, _, Some(cut)) if cut.original.as_str() == "synthetic-originalZ"
             )), "cut captured stale view-build text");
         } else {
             assert!(
-                messages.iter().any(|message| matches!(message,
-                    Message::EditorPasswordChanged(value) if value == "synthetic-originalZ"
-                )),
+                messages
+                    .iter()
+                    .any(|message| matches!(test_message(message),
+                        Message::EditorPasswordChanged(value) if value == "synthetic-originalZ"
+                    )),
                 "batched typing after cut lost the unconfirmed original"
             );
         }
@@ -877,12 +1089,12 @@ fn gui_password_cut_batches_preserve_uncopied_draft() {
     command_key(&mut ui, "x");
     assert!(
         !ui.into_messages().any(|message| matches!(
-            message,
+            test_message(&message),
             Message::EditorPasswordChanged(_) | Message::CopyEditorPasswordSelection(..)
         )),
         "cut without selection changed a password"
     );
-    let _ = app.update(Message::EditorPasswordChanged("ab👩‍💻e\u{301}cd".into()));
+    let _ = app.test_update(Message::EditorPasswordChanged("ab👩‍💻e\u{301}cd".into()));
     let mut ui = simulator(&app, SIZES[0]);
     ui.click(selector::id("editor-password-input")).unwrap();
     ui.tap_key(keyboard::key::Named::Home);
@@ -894,13 +1106,14 @@ fn gui_password_cut_batches_preserve_uncopied_draft() {
     ui.tap_key(keyboard::key::Named::ArrowRight);
     command_key(&mut ui, "x");
     assert!(
-        ui.into_messages().any(|message| matches!(message,
-            Message::CopyEditorPasswordSelection(_, value, Some(cut))
-            if value.as_str() == "b👩‍💻" && cut.replacement.as_str() == "ae\u{301}cd"
-        )),
+        ui.into_messages()
+            .any(|message| matches!(test_message(&message),
+                Message::CopyEditorPasswordSelection(_, value, Some(cut))
+                if value.as_str() == "b👩‍💻" && cut.replacement.as_str() == "ae\u{301}cd"
+            )),
         "cut did not respect emoji/combining grapheme boundaries"
     );
-    let _ = app.update(Message::ToggleEditorPasswordVisible(app.context_generation));
+    let _ = app.test_update(Message::ToggleEditorPasswordVisible(app.context_generation));
     let mut ui = simulator(&app, SIZES[0]);
     ui.click(selector::id("editor-password-input")).unwrap();
     command_key(&mut ui, "a");
@@ -908,7 +1121,7 @@ fn gui_password_cut_batches_preserve_uncopied_draft() {
     command_key(&mut ui, "x");
     assert!(
         !ui.into_messages().any(|message| matches!(
-            message,
+            test_message(&message),
             Message::CopyEditorPasswordSelection(..) | Message::EditorPasswordChanged(_)
         )),
         "masked input permitted copy or cut"
@@ -923,9 +1136,9 @@ fn staged_import_fixture() -> (tempfile::TempDir, App) {
         "name,url,username,password,note\nSynthetic,https://synthetic.example.test,user,one,note\n",
     )
     .unwrap();
-    let _ = app.update(Message::OpenImport);
-    let _ = app.update(Message::ImportPathChanged(source.display().to_string()));
-    let _ = app.update(Message::AnalyzeImport);
+    let _ = app.test_update(Message::OpenImport);
+    let _ = app.test_update(Message::ImportPathChanged(source.display().to_string()));
+    let _ = app.test_update(Message::AnalyzeImport);
     (dir, app)
 }
 
@@ -939,15 +1152,15 @@ fn stale_import_events_do_not_target_reanalyzed_preview() {
     let old_apply = Message::ApplyImport(old_id);
     let old_toggle = Message::ImportApplyUpdatesChanged(old_id, false);
     let old_decision = Message::SetImportResolution(old_id, 0, ConflictResolution::KeepBoth);
-    let _ = app.update(Message::AnalyzeImport);
-    let _ = app.update(old_toggle);
-    let _ = app.update(old_decision);
+    let _ = app.test_update(Message::AnalyzeImport);
+    let _ = app.test_update(old_toggle);
+    let _ = app.test_update(old_decision);
     let Panel::Import(state) = &app.panel else {
         panic!("missing import panel")
     };
     assert!(state.apply_updates);
     assert!(state.resolutions.is_empty());
-    let _ = app.update(old_apply);
+    let _ = app.test_update(old_apply);
     assert!(app.session.as_ref().unwrap().entries().is_empty());
 }
 
@@ -961,23 +1174,23 @@ fn import_path_navigation_and_lock_discard_staged_preview_and_decisions() {
         let old_id = state.preview.as_ref().unwrap().id();
         match transition {
             0 => {
-                let _ = app.update(Message::ImportPathChanged("other.csv".into()));
+                let _ = app.test_update(Message::ImportPathChanged("other.csv".into()));
             }
             1 => {
-                let _ = app.update(Message::CancelPanel);
-                let _ = app.update(Message::OpenImport);
+                let _ = app.test_update(Message::CancelPanel);
+                let _ = app.test_update(Message::OpenImport);
             }
             _ => {
-                let _ = app.update(Message::Lock);
+                let _ = app.test_update(Message::Lock);
             }
         }
-        let _ = app.update(Message::SetImportResolution(
+        let _ = app.test_update(Message::SetImportResolution(
             old_id,
             0,
             ConflictResolution::KeepBoth,
         ));
-        let _ = app.update(Message::ImportApplyUpdatesChanged(old_id, false));
-        let _ = app.update(Message::ApplyImport(old_id));
+        let _ = app.test_update(Message::ImportApplyUpdatesChanged(old_id, false));
+        let _ = app.test_update(Message::ApplyImport(old_id));
         if let Panel::Import(state) = &app.panel {
             assert!(state.preview.is_none());
             assert!(state.resolutions.is_empty());
@@ -998,12 +1211,12 @@ fn current_import_events_apply_once_and_invalid_choices_are_ignored() {
         panic!("missing import panel")
     };
     let id = state.preview.as_ref().unwrap().id();
-    let _ = app.update(Message::SetImportResolution(
+    let _ = app.test_update(Message::SetImportResolution(
         id,
         0,
         ConflictResolution::KeepBoth,
     ));
-    let _ = app.update(Message::SetImportResolution(
+    let _ = app.test_update(Message::SetImportResolution(
         id,
         99,
         ConflictResolution::KeepLocal,
@@ -1012,7 +1225,7 @@ fn current_import_events_apply_once_and_invalid_choices_are_ignored() {
         panic!("missing import panel")
     };
     assert!(state.resolutions.is_empty());
-    let _ = app.update(Message::ApplyImport(id));
+    let _ = app.test_update(Message::ApplyImport(id));
     let Panel::Import(state) = &app.panel else {
         panic!("missing import panel")
     };
@@ -1021,7 +1234,7 @@ fn current_import_events_apply_once_and_invalid_choices_are_ignored() {
     let vault = app.session.as_ref().unwrap();
     assert_eq!(vault.entries().len(), 1);
     let revision = vault.revision();
-    let _ = app.update(Message::ApplyImport(id));
+    let _ = app.test_update(Message::ApplyImport(id));
     assert_eq!(app.session.as_ref().unwrap().revision(), revision);
     assert!(app.revealed.is_none());
 }
@@ -1034,12 +1247,12 @@ fn reanalysis_and_path_edits_reset_previous_preview_options() {
             panic!("missing import panel")
         };
         let id = state.preview.as_ref().unwrap().id();
-        let _ = app.update(Message::ImportApplyUpdatesChanged(id, false));
+        let _ = app.test_update(Message::ImportApplyUpdatesChanged(id, false));
         let Panel::Import(state) = &app.panel else {
             panic!("missing import panel")
         };
         assert!(!state.apply_updates);
-        let _ = app.update(if path_edit {
+        let _ = app.test_update(if path_edit {
             Message::ImportPathChanged("other.csv".into())
         } else {
             Message::AnalyzeImport
@@ -1085,9 +1298,9 @@ fn gui_import_source_duplicates_and_independent_conflict_choices() {
             ),
         )
         .unwrap();
-        let _ = app.update(Message::OpenImport);
-        let _ = app.update(Message::ImportPathChanged(source.display().to_string()));
-        let _ = app.update(Message::AnalyzeImport);
+        let _ = app.test_update(Message::OpenImport);
+        let _ = app.test_update(Message::ImportPathChanged(source.display().to_string()));
+        let _ = app.test_update(Message::AnalyzeImport);
         let Panel::Import(state) = &app.panel else {
             panic!("missing import panel")
         };
@@ -1138,7 +1351,7 @@ fn gui_import_source_duplicates_and_independent_conflict_choices() {
                 ui.click(import_choice(index, label)).unwrap();
                 ui.into_messages().collect::<Vec<_>>()
             };
-            assert!(messages.iter().any(|message| matches!(message, Message::SetImportResolution(id, row, actual) if *id == preview_id && *row == index && actual == &resolution)));
+            assert!(messages.iter().any(|message| matches!(test_message(message), Message::SetImportResolution(id, row, actual) if *id == preview_id && *row == index && actual == &resolution)));
             apply_messages(&mut app, messages);
             let Panel::Import(state) = &app.panel else {
                 panic!("missing import panel")
@@ -1157,11 +1370,9 @@ fn gui_import_source_duplicates_and_independent_conflict_choices() {
             ui.click("执行导入").unwrap();
             ui.into_messages().collect::<Vec<_>>()
         };
-        assert!(
-            messages
-                .iter()
-                .any(|message| matches!(message, Message::ApplyImport(id) if *id == preview_id))
-        );
+        assert!(messages.iter().any(
+            |message| matches!(test_message(message), Message::ApplyImport(id) if *id == preview_id)
+        ));
         apply_messages(&mut app, messages);
         let vault = app.session.as_ref().unwrap();
         assert_eq!(vault.entries().len(), 1);
@@ -1186,7 +1397,7 @@ fn external_mutation_conflict_locks_and_revokes_ui_context() {
     let mut bytes = std::fs::read(&path).unwrap();
     bytes.push(b' ');
     std::fs::write(&path, &bytes).unwrap();
-    let _ = app.update(Message::CardAction(id, CardAction::Favorite));
+    let _ = app.test_update(Message::CardAction(id, CardAction::Favorite));
     assert!(
         app.session.is_none(),
         "external conflict must revoke the stale session"
@@ -1199,7 +1410,7 @@ fn external_mutation_conflict_locks_and_revokes_ui_context() {
 #[test]
 fn recovery_inspection_errors_are_visible_and_block_open() {
     let (dir, mut app) = fixture(0);
-    app.lock_with_status("synthetic");
+    app.test_lock_with_status("synthetic");
     // A directory full of unrelated entries exceeds the bounded inspection
     // budget. An incomplete scan must never quietly allow modification.
     for index in 0..4100 {
@@ -1209,6 +1420,7 @@ fn recovery_inspection_errors_are_visible_and_block_open() {
         app.check_startup_recovery(),
         "incomplete recovery inspection was silently ignored"
     );
+    app.test_drain_pending();
     assert!(app.recovery.is_some());
     assert!(app.status.contains("检查") || app.status.contains("恢复"));
 }
@@ -1216,29 +1428,29 @@ fn recovery_inspection_errors_are_visible_and_block_open() {
 #[test]
 fn recovery_secrets_and_late_events_are_invalidated_by_lock_and_navigation() {
     let (_dir, mut app) = fixture(0);
-    app.lock_with_status("synthetic");
+    app.test_lock_with_status("synthetic");
     for transition in [
         Message::Lock,
         Message::AuthMode(true),
         Message::ToggleAuthOptions,
         Message::PlatformSecurity(SecurityEvent::MonitorFailed),
     ] {
-        app.open_recovery();
+        app.test_open_recovery();
         let generation = app.recovery.as_ref().unwrap().generation;
-        let _ = app.update(Message::RecoveryPasswordChanged(
+        let _ = app.test_update(Message::RecoveryPasswordChanged(
             generation,
             "synthetic-secret".into(),
         ));
-        let _ = app.update(transition);
+        let _ = app.test_update(transition);
         assert!(
             app.recovery.is_none(),
             "navigation left recovery secrets live"
         );
-        let _ = app.update(Message::RecoveryPasswordChanged(
+        let _ = app.test_update(Message::RecoveryPasswordChanged(
             generation,
             "stale-secret".into(),
         ));
-        let _ = app.update(Message::RestoreRecoveryCopy(generation));
+        let _ = app.test_update(Message::RestoreRecoveryCopy(generation));
         assert!(app.recovery.is_none());
         assert!(app.session.is_none());
     }
@@ -1250,80 +1462,80 @@ fn recovery_selected_copy_wrong_password_corruption_collision_and_success() {
     let source = app.session.as_ref().unwrap().path().to_path_buf();
     let original = std::fs::read(&source).unwrap();
     let destination = dir.path().join("restored-new.pmvault");
-    app.lock_with_status("synthetic");
+    app.test_lock_with_status("synthetic");
     app.security_monitor_ready = true;
-    app.open_recovery();
+    app.test_open_recovery();
     let generation = app.recovery.as_ref().unwrap().generation;
-    let _ = app.update(Message::RecoverySourceChanged(
+    let _ = app.test_update(Message::RecoverySourceChanged(
         generation,
         source.display().to_string(),
     ));
-    let _ = app.update(Message::RecoveryDestinationChanged(
+    let _ = app.test_update(Message::RecoveryDestinationChanged(
         generation,
         destination.display().to_string(),
     ));
-    let _ = app.update(Message::RecoveryPasswordChanged(
+    let _ = app.test_update(Message::RecoveryPasswordChanged(
         generation,
         "wrong-password".into(),
     ));
-    let _ = app.update(Message::RestoreRecoveryCopy(generation));
+    let _ = app.test_update(Message::RestoreRecoveryCopy(generation));
     assert!(!destination.exists());
     assert!(app.recovery.as_ref().unwrap().password.is_empty());
     let corrupt = dir.path().join("corrupt.pmvault");
     std::fs::write(&corrupt, b"corrupt synthetic").unwrap();
-    let _ = app.update(Message::RecoverySourceChanged(
+    let _ = app.test_update(Message::RecoverySourceChanged(
         generation,
         corrupt.display().to_string(),
     ));
-    let _ = app.update(Message::RecoveryPasswordChanged(
+    let _ = app.test_update(Message::RecoveryPasswordChanged(
         generation,
         "synthetic-only".into(),
     ));
-    let _ = app.update(Message::RestoreRecoveryCopy(generation));
+    let _ = app.test_update(Message::RestoreRecoveryCopy(generation));
     assert!(!destination.exists());
-    let _ = app.update(Message::RecoverySourceChanged(
+    let _ = app.test_update(Message::RecoverySourceChanged(
         generation,
         source.display().to_string(),
     ));
     std::fs::write(&destination, b"another file").unwrap();
-    let _ = app.update(Message::RecoveryPasswordChanged(
+    let _ = app.test_update(Message::RecoveryPasswordChanged(
         generation,
         "gui-synthetic-master-only".into(),
     ));
-    let _ = app.update(Message::RestoreRecoveryCopy(generation));
+    let _ = app.test_update(Message::RestoreRecoveryCopy(generation));
     assert_eq!(std::fs::read(&destination).unwrap(), b"another file");
     let new_destination = dir.path().join("actually-new.pmvault");
-    let _ = app.update(Message::RecoveryDestinationChanged(
+    let _ = app.test_update(Message::RecoveryDestinationChanged(
         generation,
         new_destination.display().to_string(),
     ));
-    let _ = app.update(Message::RecoveryPasswordChanged(
+    let _ = app.test_update(Message::RecoveryPasswordChanged(
         generation,
         "gui-synthetic-master-only".into(),
     ));
-    let _ = app.update(Message::RestoreRecoveryCopy(generation));
+    let _ = app.test_update(Message::RestoreRecoveryCopy(generation));
     assert!(app.recovery.is_none());
     assert!(app.session.is_none());
     assert_eq!(std::fs::read(&new_destination).unwrap(), original);
     assert_eq!(std::fs::read(&source).unwrap(), original);
-    let _ = app.update(Message::RestoreRecoveryCopy(generation));
+    let _ = app.test_update(Message::RestoreRecoveryCopy(generation));
     assert_eq!(std::fs::read(new_destination).unwrap(), original);
 }
 #[test]
 fn mutation_and_import_uncertainty_lock_but_rejected_mutation_keeps_session() {
-    use crate::storage::transaction::{Point, set_hook};
+    use crate::storage::transaction::{Point, set_worker_hook};
     let (_dir, mut app) = fixture(1);
     let id = app.session.as_ref().unwrap().entries()[0].id;
-    set_hook(Point::BeforePublish, || {
+    set_worker_hook(Point::BeforePublish, || {
         Err(AppError::Platform("synthetic staging rejection".into()))
     });
-    let _ = app.update(Message::CardAction(id, CardAction::Favorite));
+    let _ = app.test_update(Message::CardAction(id, CardAction::Favorite));
     assert!(app.session.is_some());
     assert!(!app.session.as_ref().unwrap().entry(id).unwrap().favorite);
-    set_hook(Point::AfterPublish, || {
+    set_worker_hook(Point::AfterPublish, || {
         Err(AppError::Platform("synthetic uncertain sync".into()))
     });
-    let _ = app.update(Message::CardAction(id, CardAction::Favorite));
+    let _ = app.test_update(Message::CardAction(id, CardAction::Favorite));
     assert!(app.session.is_none());
     assert!(app.recovery_notice.is_some());
     let (dir, mut app) = fixture(0);
@@ -1333,37 +1545,37 @@ fn mutation_and_import_uncertainty_lock_but_rejected_mutation_keeps_session() {
         "name,url,username,password,note\nSynthetic,https://example.test,u,p,\n",
     )
     .unwrap();
-    let _ = app.update(Message::OpenImport);
-    let _ = app.update(Message::ImportPathChanged(csv.display().to_string()));
-    let _ = app.update(Message::AnalyzeImport);
+    let _ = app.test_update(Message::OpenImport);
+    let _ = app.test_update(Message::ImportPathChanged(csv.display().to_string()));
+    let _ = app.test_update(Message::AnalyzeImport);
     let id = match &app.panel {
         Panel::Import(s) => s.preview.as_ref().unwrap().id(),
         _ => panic!(),
     };
-    set_hook(Point::AfterPublish, || {
+    set_worker_hook(Point::AfterPublish, || {
         Err(AppError::Platform("synthetic uncertain import".into()))
     });
-    let _ = app.update(Message::ApplyImport(id));
+    let _ = app.test_update(Message::ApplyImport(id));
     assert!(app.session.is_none());
     assert!(matches!(app.panel, Panel::Vault));
     assert!(app.recovery.is_some());
-    let _ = app.update(Message::ApplyImport(id));
+    let _ = app.test_update(Message::ApplyImport(id));
     assert!(app.session.is_none());
 }
 #[test]
 fn recovery_picker_late_results_and_pending_restore_are_rejected() {
     let (_dir, mut app) = fixture(0);
-    app.lock_with_status("synthetic");
-    app.open_recovery();
+    app.test_lock_with_status("synthetic");
+    app.test_open_recovery();
     let generation = app.recovery.as_ref().unwrap().generation;
     let _ = app.begin_picker(picker::Purpose::RecoverySource);
-    let _ = app.update(Message::RestoreRecoveryCopy(generation));
+    let _ = app.test_update(Message::RestoreRecoveryCopy(generation));
     assert!(app.recovery.as_ref().unwrap().source.is_empty());
     app.dismiss_recovery();
-    app.open_recovery();
+    app.test_open_recovery();
     // Native picker-specific late-result assertions also live in picker tests.
     assert_ne!(app.recovery.as_ref().unwrap().generation, generation);
-    let _ = app.update(Message::RecoverySourceChanged(
+    let _ = app.test_update(Message::RecoverySourceChanged(
         generation,
         "stale.pmvault".into(),
     ));
@@ -1374,8 +1586,8 @@ fn recovery_picker_late_results_and_pending_restore_are_rejected() {
 fn recovery_does_not_derive_or_create_before_windows_monitor_ready() {
     let (dir, mut app) = fixture(0);
     let source = app.session.as_ref().unwrap().path().to_path_buf();
-    app.lock_with_status("synthetic");
-    app.open_recovery();
+    app.test_lock_with_status("synthetic");
+    app.test_open_recovery();
     app.security_monitor_ready = false;
     let state = app.recovery.as_mut().unwrap();
     state.source = source.display().to_string();
@@ -1386,7 +1598,7 @@ fn recovery_does_not_derive_or_create_before_windows_monitor_ready() {
         .to_string();
     *state.password = "gui-synthetic-master-only".into();
     let generation = state.generation;
-    let _ = app.update(Message::RestoreRecoveryCopy(generation));
+    let _ = app.test_update(Message::RestoreRecoveryCopy(generation));
     assert!(!dir.path().join("must-not-exist.pmvault").exists());
     assert!(app.recovery.as_ref().unwrap().password.is_empty());
     assert!(app.status.contains("监控"));
@@ -1398,7 +1610,7 @@ fn gui_locked_recovery_interactions_at_three_sizes() {
     for size in SIZES {
         let (dir, mut app) = fixture(1);
         let source = app.session.as_ref().unwrap().path().to_path_buf();
-        app.lock_with_status("synthetic recovery review");
+        app.test_lock_with_status("synthetic recovery review");
         app.security_monitor_ready = true;
         let mut ui = simulator(&app, size);
         ui.click("检查恢复副本").unwrap();
@@ -1455,7 +1667,7 @@ fn gui_locked_recovery_interactions_at_three_sizes() {
 
 #[test]
 fn confirmed_restore_adopts_verified_session_or_locks_on_uncertainty() {
-    use crate::storage::transaction::{Point, set_hook};
+    use crate::storage::transaction::{Point, set_worker_hook};
     for point in [Some(Point::BeforePublish), Some(Point::AfterPublish), None] {
         let (dir, mut app) = fixture(1);
         let old_id = app.session.as_ref().unwrap().vault_id();
@@ -1463,18 +1675,18 @@ fn confirmed_restore_adopts_verified_session_or_locks_on_uncertainty() {
         let source_session = VaultSession::create(&source, "restore-synthetic-only").unwrap();
         let expected_id = source_session.vault_id();
         let source_bytes = std::fs::read(&source).unwrap();
-        let _ = app.update(Message::OpenSettings);
-        let _ = app.update(Message::RestorePathChanged(source.display().to_string()));
-        let _ = app.update(Message::RestorePasswordChanged(
+        let _ = app.test_update(Message::OpenSettings);
+        let _ = app.test_update(Message::RestorePathChanged(source.display().to_string()));
+        let _ = app.test_update(Message::RestorePasswordChanged(
             "restore-synthetic-only".into(),
         ));
-        let _ = app.update(Message::ConfirmRestoreChanged(true));
+        let _ = app.test_update(Message::ConfirmRestoreChanged(true));
         if let Some(point) = point {
-            set_hook(point, || {
+            set_worker_hook(point, || {
                 Err(AppError::Platform("synthetic restore boundary".into()))
             });
         }
-        let _ = app.update(Message::RestoreBackup);
+        let _ = app.test_update(Message::RestoreBackup);
         match point {
             Some(Point::BeforePublish) => {
                 assert_eq!(app.session.as_ref().unwrap().vault_id(), old_id);
@@ -1492,7 +1704,7 @@ fn confirmed_restore_adopts_verified_session_or_locks_on_uncertainty() {
             }
         }
         assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
-        let _ = app.update(Message::RestoreBackup);
+        let _ = app.test_update(Message::RestoreBackup);
         assert!(point != Some(Point::AfterPublish) || app.session.is_none());
     }
 }
@@ -1512,7 +1724,7 @@ fn review_c1_manual_path_edit_does_not_navigate_or_clear_passwords() {
             "/synthetic-not-yet-existing/",
             "complete.pmvault",
         ] {
-            let _ = app.update(Message::VaultPathChanged(path.into()));
+            let _ = app.test_update(Message::VaultPathChanged(path.into()));
             assert!(
                 app.recovery.is_none(),
                 "manual input was interpreted as open"
@@ -1527,13 +1739,14 @@ fn review_c1_manual_path_edit_does_not_navigate_or_clear_passwords() {
 fn review_c2_recovery_keeps_clipboard_warning_after_uncertainty() {
     let (_dir, mut app) = fixture(1);
     let id = app.session.as_ref().unwrap().entries()[0].id;
-    let _ = app.update(Message::PlatformSecurity(
+    let _ = app.test_update(Message::PlatformSecurity(
         SecurityEvent::ClipboardCleanupFailed,
     ));
-    crate::storage::transaction::set_hook(crate::storage::transaction::Point::AfterPublish, || {
-        Err(AppError::Platform("synthetic uncertainty".into()))
-    });
-    let _ = app.update(Message::CardAction(id, CardAction::Favorite));
+    crate::storage::transaction::set_worker_hook(
+        crate::storage::transaction::Point::AfterPublish,
+        || Err(AppError::Platform("synthetic uncertainty".into())),
+    );
+    let _ = app.test_update(Message::CardAction(id, CardAction::Favorite));
     assert!(app.session.is_none());
     assert!(app.recovery.is_some());
     app.status = "a later error must not hide the warning".into();
@@ -1571,7 +1784,7 @@ fn review_c3_save_verification_missing_or_unsupported_source_locks() {
             error.invalidates_session(),
             "missing/type source failure was not invalidating"
         );
-        let _ = app.update(Message::Save);
+        let _ = app.test_update(Message::Save);
         assert!(app.session.is_none());
         assert!(app.revealed.is_none());
         assert!(app.clipboard_session.is_none());
@@ -1692,10 +1905,10 @@ fn gui_review_recovery_clipboard_warning_survives_password_error() {
         let (dir, mut app) = fixture(1);
         app.security_monitor_ready = true;
         let id = app.session.as_ref().unwrap().entries()[0].id;
-        let _ = app.update(Message::PlatformSecurity(
+        let _ = app.test_update(Message::PlatformSecurity(
             SecurityEvent::ClipboardCleanupFailed,
         ));
-        crate::storage::transaction::set_hook(
+        crate::storage::transaction::set_worker_hook(
             crate::storage::transaction::Point::AfterPublish,
             || {
                 Err(AppError::Platform(
@@ -1703,12 +1916,12 @@ fn gui_review_recovery_clipboard_warning_survives_password_error() {
                 ))
             },
         );
-        let _ = app.update(Message::CardAction(id, CardAction::Favorite));
+        let _ = app.test_update(Message::CardAction(id, CardAction::Favorite));
         assert!(app.recovery.is_some());
         let mut ui = simulator(&app, size);
         ui.click("我已手动处理剪贴板").unwrap();
         let stale: Vec<_> = ui.into_messages().collect();
-        let _ = app.update(Message::PlatformSecurity(
+        let _ = app.test_update(Message::PlatformSecurity(
             SecurityEvent::ClipboardCleanupFailed,
         ));
         apply_messages(&mut app, stale);
@@ -1750,7 +1963,7 @@ fn gui_review_recovery_clipboard_warning_survives_password_error() {
 #[test]
 fn review_c3_matching_source_verification_keeps_live_session() {
     let (_dir, mut app) = fixture(1);
-    let _ = app.update(Message::Save);
+    let _ = app.test_update(Message::Save);
     assert!(app.session.is_some());
     assert!(app.clipboard_session.is_some());
     assert!(app.recovery.is_none());
@@ -1778,13 +1991,13 @@ fn gui_export_failure_warning_survives_lock() {
         .secret
         .ciphertext
         .clear();
-    let _ = app.update(Message::OpenSettings);
-    let _ = app.update(Message::CsvPathChanged(
+    let _ = app.test_update(Message::OpenSettings);
+    let _ = app.test_update(Message::CsvPathChanged(
         dir.path().join("partial.csv").display().to_string(),
     ));
-    let _ = app.update(Message::ConfirmPlaintextChanged(true));
-    let _ = app.update(Message::ExportPlaintextCsv);
-    let _ = app.update(Message::Lock);
+    let _ = app.test_update(Message::ConfirmPlaintextChanged(true));
+    let _ = app.test_update(Message::ExportPlaintextCsv);
+    let _ = app.test_update(Message::Lock);
     let mut ui = simulator(&app, SIZES[0]);
     assert!(
         ui.find("明文导出未完成，文件可能仍然存在").is_ok(),
@@ -1822,10 +2035,10 @@ fn gui_export_warning_navigation_recovery_and_close_at_all_sizes() {
         let generation = app.export_notice.as_ref().unwrap().generation;
         for phase in ["unlocked", "locked", "recovery"] {
             if phase == "locked" {
-                let _ = app.update(Message::Lock);
+                let _ = app.test_update(Message::Lock);
             }
             if phase == "recovery" {
-                let _ = app.update(Message::OpenRecovery);
+                let _ = app.test_update(Message::OpenRecovery);
             }
             let mut ui = simulator(&app, size);
             assert!(
@@ -1864,7 +2077,7 @@ fn gui_export_warning_navigation_recovery_and_close_at_all_sizes() {
             capture(&app, &format!("export-warning-{phase}"), size);
             assert_eq!(app.export_notice.as_ref().unwrap().generation, generation);
         }
-        let _ = app.update(Message::CloseRequested(iced::window::Id::unique()));
+        let _ = app.test_update(Message::CloseRequested(iced::window::Id::unique()));
         assert!(app.session.is_none());
         capture(&app, "export-warning-close", size);
         let mut ui = simulator(&app, size);
@@ -1885,15 +2098,15 @@ fn gui_export_warning_navigation_recovery_and_close_at_all_sizes() {
         apply_messages(&mut app, messages);
         assert!(app.export_notice.is_none());
         install_long_export_notice(&mut app);
-        let _ = app.update(Message::AcknowledgeExportNotice(generation));
+        let _ = app.test_update(Message::AcknowledgeExportNotice(generation));
         assert!(app.export_notice.is_some());
-        let _ = app.update(Message::CloseRequested(iced::window::Id::unique()));
+        let _ = app.test_update(Message::CloseRequested(iced::window::Id::unique()));
         let mut ui = simulator(&app, size);
         ui.click("我理解明文可能残留，仍然退出").unwrap();
         let messages: Vec<_> = ui.into_messages().collect();
         assert_eq!(messages.len(), 1);
         for message in messages {
-            assert!(app.update(message).units() > 0);
+            assert!(app.test_update(message).units() > 0);
         }
         assert!(app.export_close_prompt.is_none());
         assert!(app.export_notice.is_some());
@@ -1904,24 +2117,24 @@ fn gui_export_warning_navigation_recovery_and_close_at_all_sizes() {
 #[ignore = "headless GUI regression"]
 fn gui_export_repeat_button_is_disabled_until_current_notice_acknowledged() {
     let (_dir, mut app) = fixture(1);
-    let _ = app.update(Message::OpenSettings);
-    let _ = app.update(Message::ConfirmPlaintextChanged(true));
+    let _ = app.test_update(Message::OpenSettings);
+    let _ = app.test_update(Message::ConfirmPlaintextChanged(true));
     install_long_export_notice(&mut app);
     let mut ui = simulator(&app, SIZES[0]);
     scroll_picker_into_view(&mut ui, "导出明文 CSV", SIZES[0]);
     ui.click("导出明文 CSV").unwrap();
     assert!(
         !ui.into_messages()
-            .any(|message| matches!(message, Message::ExportPlaintextCsv))
+            .any(|message| matches!(test_message(&message), Message::ExportPlaintextCsv))
     );
     let generation = app.export_notice.as_ref().unwrap().generation;
-    let _ = app.update(Message::AcknowledgeExportNotice(generation));
+    let _ = app.test_update(Message::AcknowledgeExportNotice(generation));
     let mut ui = simulator(&app, SIZES[0]);
     scroll_picker_into_view(&mut ui, "导出明文 CSV", SIZES[0]);
     ui.click("导出明文 CSV").unwrap();
     assert!(
         ui.into_messages()
-            .any(|message| matches!(message, Message::ExportPlaintextCsv))
+            .any(|message| matches!(test_message(&message), Message::ExportPlaintextCsv))
     );
 }
 
@@ -1932,7 +2145,7 @@ fn gui_export_close_warning_keeps_clipboard_acknowledgment_usable() {
         let (_dir, mut app) = fixture(0);
         install_long_export_notice(&mut app);
         app.note_clipboard_cleanup_failure();
-        let _ = app.update(Message::CloseRequested(iced::window::Id::unique()));
+        let _ = app.test_update(Message::CloseRequested(iced::window::Id::unique()));
         capture(&app, "export-warning-close-clipboard", size);
         let mut ui = simulator(&app, size);
         let button = ui.find("我已手动处理剪贴板").unwrap();

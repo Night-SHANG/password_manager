@@ -1648,5 +1648,5 @@ mod owner {
         }
     }
 }
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 pub(super) use owner::*;

@@ -8,6 +8,7 @@ use super::*;
 
 mod export_notice;
 mod forms;
+mod operation;
 mod recovery;
 mod secret_input;
 
@@ -16,6 +17,41 @@ mod long_text_tests;
 
 const SIDEBAR_WIDTH: f32 = 250.0;
 const CARD_WIDTH: f32 = 272.0;
+pub(super) const CARD_PAGE_SIZE: usize = 24;
+pub(super) const IMPORT_PAGE_SIZE: usize = 8;
+pub(super) const CANDIDATE_PAGE_SIZE: usize = 8;
+pub(super) const CATEGORY_PAGE_SIZE: usize = 24;
+
+pub(super) fn page_range(
+    count: usize,
+    requested: usize,
+    size: usize,
+) -> (usize, std::ops::Range<usize>) {
+    let page = requested.min(count.saturating_sub(1) / size);
+    let start = page * size;
+    (page, start..start.saturating_add(size).min(count))
+}
+
+fn page_controls<'a>(
+    count: usize,
+    page: usize,
+    size: usize,
+    change: impl Fn(usize) -> Message + 'a,
+) -> Element<'a, Message> {
+    let pages = count.div_ceil(size).max(1);
+    row![
+        button("上一页")
+            .on_press_maybe((page > 0).then(|| change(page - 1)))
+            .style(button::secondary),
+        text(format!("第 {} / {} 页", page + 1, pages)).size(12),
+        button("下一页")
+            .on_press_maybe((page + 1 < pages).then(|| change(page + 1)))
+            .style(button::secondary),
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center)
+    .into()
+}
 
 fn field<'a>(
     label: &'a str,
@@ -235,6 +271,16 @@ impl App {
     }
 
     fn workspace_view(&self) -> Element<'_, Message> {
+        let snapshot = self
+            .operations
+            .authority
+            .snapshot(std::time::Instant::now());
+        if snapshot.masked
+            || self.operation_busy()
+            || matches!(self.operations.session, operations::SessionUi::Locking)
+        {
+            return self.operation_view();
+        }
         let Some(session) = &self.session else {
             return self.locked_view();
         };
@@ -492,32 +538,47 @@ impl App {
             self.nav_button(
                 "全部".to_string(),
                 NavFilter::All,
-                session.active_entries().count()
+                self.view_index.as_ref().map_or_else(
+                    || session.active_entries().count(),
+                    view_index::ViewIndex::active_count
+                )
             ),
             self.nav_button(
                 "收藏".to_string(),
                 NavFilter::Favorites,
-                session.active_entries().filter(|e| e.favorite).count()
+                self.view_index.as_ref().map_or_else(
+                    || session.active_entries().filter(|e| e.favorite).count(),
+                    view_index::ViewIndex::favorite_count
+                )
             ),
             self.nav_button(
                 "回收站".to_string(),
                 NavFilter::RecycleBin,
-                session.entries().iter().filter(|e| e.is_deleted()).count()
+                self.view_index.as_ref().map_or_else(
+                    || session.entries().iter().filter(|e| e.is_deleted()).count(),
+                    view_index::ViewIndex::deleted_count
+                )
             ),
             divider(),
         ]
         .spacing(5);
-        for name in session.categories() {
-            categories = categories.push(
-                self.nav_button(
-                    name.clone(),
-                    NavFilter::Category(name.clone()),
-                    session
-                        .active_entries()
-                        .filter(|e| &e.category == name)
-                        .count(),
+        let category_count = session.categories().len();
+        let (category_page, category_range) =
+            page_range(category_count, self.category_page, CATEGORY_PAGE_SIZE);
+        for name in &session.categories()[category_range] {
+            categories = categories.push(self.nav_button(
+                name.clone(),
+                NavFilter::Category(name.clone()),
+                self.view_index.as_ref().map_or_else(
+                    || {
+                        session
+                            .active_entries()
+                            .filter(|entry| &entry.category == name)
+                            .count()
+                    },
+                    |index| index.category_count(name),
                 ),
-            );
+            ));
             if enabled && self.nav == NavFilter::Category(name.clone()) && name != "其他" {
                 categories = categories.push(
                     row![
@@ -557,6 +618,44 @@ impl App {
                 .align_y(Alignment::Center),
             divider(),
             scrollable(categories).height(Length::Fill),
+            if category_count > CATEGORY_PAGE_SIZE {
+                column![
+                    row![
+                        button("上一页分类")
+                            .on_press_maybe(
+                                (enabled && category_page > 0).then_some(Message::NavigatePage(
+                                    PageTarget::Categories,
+                                    false
+                                ))
+                            )
+                            .style(button::secondary)
+                            .padding([6, 4])
+                            .width(Length::Fill),
+                        button("下一页分类")
+                            .on_press_maybe(
+                                (enabled
+                                    && (category_page + 1) * CATEGORY_PAGE_SIZE < category_count)
+                                    .then_some(Message::NavigatePage(PageTarget::Categories, true))
+                            )
+                            .style(button::secondary)
+                            .padding([6, 4])
+                            .width(Length::Fill),
+                    ]
+                    .spacing(6),
+                    text(format!(
+                        "分类第 {} / {} 页 · 共 {} 个",
+                        category_page + 1,
+                        category_count.div_ceil(CATEGORY_PAGE_SIZE),
+                        category_count
+                    ))
+                    .size(11),
+                    text("Alt + PageUp / PageDown 翻分类").size(10),
+                ]
+                .spacing(4)
+                .into()
+            } else {
+                Element::from(Space::new().height(0))
+            },
             footer,
             divider(),
             button("导入数据")
@@ -588,15 +687,60 @@ impl App {
             .into()
     }
 
+    pub(super) fn card_positions<'a>(
+        &'a self,
+        session: &'a VaultSession,
+    ) -> std::borrow::Cow<'a, [usize]> {
+        if let Some(index) = &self.view_index {
+            std::borrow::Cow::Borrowed(
+                self.filtered_entries
+                    .as_deref()
+                    .unwrap_or_else(|| index.positions(&self.nav)),
+            )
+        } else {
+            // Compatibility with legacy directly-installed synthetic fixtures.
+            let query = self.search.to_lowercase();
+            std::borrow::Cow::Owned(
+                session
+                    .entries()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| self.entry_visible(entry, &query))
+                    .map(|(position, _)| position)
+                    .collect(),
+            )
+        }
+    }
+
+    pub(super) fn card_target_visible(&self, id: Uuid) -> bool {
+        if !matches!(self.panel, Panel::Vault) {
+            return false;
+        }
+        let Some(session) = self.session.as_ref() else {
+            return false;
+        };
+        // VaultSession resolves duplicate IDs to their first record. Require
+        // that actual target, rather than another same-ID row, on this page.
+        let target = match self.view_index.as_ref() {
+            Some(index) => index.position(session, id),
+            None => session.entries().iter().position(|entry| entry.id == id),
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        let positions = self.card_positions(session);
+        let (_, range) = page_range(positions.len(), self.card_page, CARD_PAGE_SIZE);
+        // Navigation/filter positions preserve increasing body order.
+        positions[range].binary_search(&target).is_ok()
+    }
+
     fn cards_view<'a>(&'a self, session: &'a VaultSession) -> Element<'a, Message> {
-        let query = self.search.to_lowercase();
-        let entries: Vec<_> = session
-            .entries()
-            .iter()
-            .filter(|entry| self.entry_visible(entry, &query))
-            .collect();
-        let count = entries.len();
-        let body: Element<'_, Message> = if entries.is_empty() {
+        // Worker-prepared metadata and update-cached query matches preserve
+        // full-data filtering. Only the current stable slice becomes widgets.
+        let positions = self.card_positions(session);
+        let count = positions.len();
+        let (page, range) = page_range(count, self.card_page, CARD_PAGE_SIZE);
+        let body: Element<'_, Message> = if count == 0 {
             container(text("没有符合条件的密码。可添加密码或导入数据。").size(14))
                 .padding(24)
                 .width(Length::Fill)
@@ -605,11 +749,13 @@ impl App {
             // Fixed-width cards + wrapping rows + vertical-only scrolling.
             // Unlike the replaced table, there is no Fill column in an
             // unbounded horizontal scroll viewport.
-            row(entries.into_iter().map(|entry| self.password_card(entry)))
-                .spacing(20)
-                .width(Length::Fill)
-                .wrap()
-                .into()
+            row(positions[range.clone()]
+                .iter()
+                .map(|position| self.password_card(&session.entries()[*position])))
+            .spacing(20)
+            .width(Length::Fill)
+            .wrap()
+            .into()
         };
         column![
             row![
@@ -627,7 +773,19 @@ impl App {
             .spacing(12)
             .align_y(Alignment::Center),
             divider(),
-            text(format!("显示 {count} 条 · 右键查看条目操作")).size(12),
+            row![
+                text(format!(
+                    "共 {count} 条 · 当前 {}–{} 条 · 右键查看条目操作",
+                    if count == 0 { 0 } else { range.start + 1 },
+                    range.end
+                ))
+                .size(12),
+                Space::new().width(Length::Fill),
+                page_controls(count, page, CARD_PAGE_SIZE, Message::SetCardPage),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+            text("Ctrl + PageUp / PageDown 翻页").size(11),
             scrollable(body).height(Length::Fill).width(Length::Fill),
         ]
         .spacing(16)

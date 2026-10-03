@@ -1,6 +1,11 @@
 use std::path::Path;
 
 mod clipboard;
+mod operation_authority;
+pub(crate) use operation_authority::{
+    OperationRegistration, observe_operation_close, operation_monitor_required,
+    register_operation_authority,
+};
 pub(crate) mod file_transaction;
 #[cfg(any(windows, test))]
 mod security_monitor;

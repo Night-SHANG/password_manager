@@ -15,7 +15,7 @@ name = "password-manager"
 path = "src/main.rs"
 
 [dependencies]
-argon2 = "=0.6.0"
+argon2 = { version = "=0.6.0", features = ["zeroize"] }
 base64 = "=0.22.1"
 chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }
 csv = "=1.4.0"

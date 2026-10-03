@@ -26,6 +26,7 @@ impl PlaintextExportAcknowledgement {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
+    Interrupted,
     Resolve,
     CreateParents,
     CreateOutput,
@@ -42,6 +43,7 @@ pub enum Stage {
 /// Deliberately excludes OS/debug/decoder strings which can contain user data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cause {
+    Interrupted,
     Io {
         kind: io::ErrorKind,
         code: Option<i32>,
@@ -64,6 +66,7 @@ impl From<io::Error> for Cause {
 impl std::fmt::Display for Cause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Interrupted => f.write_str("worker stopped before a terminal export result"),
             Self::Io { kind, code } => write!(f, "I/O {kind:?} (OS code {code:?})"),
             Self::SecretUnavailable => f.write_str("entry secret could not be decoded"),
             Self::IdentityChanged => f.write_str("output identity does not match"),
@@ -112,6 +115,51 @@ pub fn export_plaintext_csv(
 ) -> Result<usize> {
     export_with(vault, destination, &SystemIo)
         .map_err(|failure| AppError::Export(Box::new(failure)))
+}
+
+/// Owned one-shot GUI export intent. Neither its destination nor the user's
+/// acknowledgement can be substituted after the prepared binding is issued.
+pub(crate) struct PreparedCsv {
+    destination: PathBuf,
+    acknowledgement: PlaintextExportAcknowledgement,
+    binding: crate::operations::PreparedBinding,
+}
+impl PreparedCsv {
+    pub(crate) fn new(
+        vault: &VaultSession,
+        destination: PathBuf,
+        acknowledgement: PlaintextExportAcknowledgement,
+        operation: crate::operations::OperationId,
+    ) -> Self {
+        Self {
+            destination,
+            acknowledgement,
+            binding: crate::operations::PreparedBinding {
+                prepared_id: uuid::Uuid::new_v4(),
+                operation,
+                session: Some(vault.operation_binding()),
+            },
+        }
+    }
+    pub(crate) fn binding(&self) -> crate::operations::PreparedBinding {
+        self.binding
+    }
+    pub(crate) fn commit(
+        self,
+        vault: &VaultSession,
+        lease: &crate::operations::authority::CommitLease,
+    ) -> Result<usize> {
+        if !lease.authorizes(self.binding)
+            || self.binding.session != Some(vault.operation_binding())
+        {
+            return Err(AppError::Input(
+                "export operation authority mismatch".into(),
+            ));
+        }
+        let _ = self.acknowledgement;
+        export_with(vault, &self.destination, &SystemIo)
+            .map_err(|failure| AppError::Export(Box::new(failure)))
+    }
 }
 
 fn export_with(

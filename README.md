@@ -103,6 +103,21 @@ Plaintext CSV now uses exclusive creation, owned zeroizing serialization and an
 identity/content readback checkpoint. A failed export deliberately leaves its
 output alone and reports that empty, partial or complete plaintext may remain;
 a full-path warning survives lock/navigation and guards normal exit. Export
-remains synchronous, and forced termination can bypass the in-memory warning.
+runs on the bounded vault worker, and forced termination can bypass the in-memory warning.
 Supported local filesystems and Windows path safety rejections are listed in
 [Owned CSV export](docs/owned-csv-export.md).
+
+
+## Background operation boundary
+
+Create/open, vault verification and mutations, import analysis/application,
+encrypted backup/restore, recovery inspection and plaintext CSV run on one owned
+worker lane. Cancellation stops unclaimed publication; an already-authorized
+write finishes verification and cleanup. Lock masks the UI immediately, while
+“fully locked” waits for actual owner cleanup. A blocked OS call can leave the
+masked application finishing indefinitely; it is never reported as completed
+cancellation. Public library APIs remain synchronous.
+
+The existing card and import views use bounded pages with global search/filtering,
+full counts and keyboard navigation. See [Background operations](docs/background-operations.md)
+for authority, memory, measured-validation and remaining acceptance boundaries.

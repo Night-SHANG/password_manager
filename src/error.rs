@@ -45,6 +45,9 @@ pub enum AppError {
     #[error("target vault already exists")]
     AlreadyExists,
 
+    #[error(transparent)]
+    ImportCleanup(Box<crate::import::ImportCleanupFailure>),
+
     #[error("migration failed: {0}")]
     Migration(String),
 

@@ -23,6 +23,15 @@ pub(super) struct Pending {
 
 impl App {
     pub(super) fn picker_allowed(&self, purpose: Purpose) -> bool {
+        if self.operation_busy()
+            || self
+                .operations
+                .authority
+                .snapshot(std::time::Instant::now())
+                .masked
+        {
+            return false;
+        }
         match purpose {
             Purpose::RecoverySource | Purpose::RecoveryDestination => {
                 self.session.is_none() && self.recovery.is_some()
@@ -114,6 +123,11 @@ impl App {
             return;
         }
         self.picker_pending = None;
+        if self.operations.inspect_after_picker {
+            self.operations.inspect_after_picker = false;
+            self.start_inspection(true);
+            return;
+        }
         if !pending.valid || !self.picker_allowed(pending.purpose) {
             return;
         }
@@ -228,9 +242,9 @@ mod tests {
             app.auth_options_open = true;
             let _ = app.begin_picker(Purpose::OpenVault);
             let first = app.picker_pending.unwrap();
-            let _ = app.update(transition);
+            let _ = app.test_update(transition);
             let expected = app.vault_path.clone();
-            let _ = app.update(Message::AuthMode(false));
+            let _ = app.test_update(Message::AuthMode(false));
             app.auth_options_open = true;
             app.finish_picker(first.id, Ok(Some(PathBuf::from("stale.pmvault"))));
             assert_eq!(app.vault_path, expected);
@@ -243,6 +257,7 @@ mod tests {
         app.session = Some(
             VaultSession::create(dir.path().join("synthetic.pmvault"), "synthetic-only").unwrap(),
         );
+        app.reset_unlocked_state();
         (dir, app)
     }
 
@@ -264,10 +279,10 @@ mod tests {
                     app.auth_options_open = true;
                 }
                 Purpose::Import => {
-                    let _ = app.update(Message::OpenImport);
+                    let _ = app.test_update(Message::OpenImport);
                 }
                 _ => {
-                    let _ = app.update(Message::OpenSettings);
+                    let _ = app.test_update(Message::OpenSettings);
                 }
             }
             if let Panel::Settings(s) = &mut app.panel {
@@ -320,11 +335,11 @@ mod tests {
     #[test]
     fn picker_old_callbacks_cannot_clear_new_request_or_reopened_panel() {
         let (_dir, mut app) = workspace();
-        let _ = app.update(Message::OpenImport);
+        let _ = app.test_update(Message::OpenImport);
         let _ = app.begin_picker(Purpose::Import);
         let first = app.picker_pending.unwrap().id;
-        let _ = app.update(Message::CancelPanel);
-        let _ = app.update(Message::OpenImport);
+        let _ = app.test_update(Message::CancelPanel);
+        let _ = app.test_update(Message::OpenImport);
         assert_eq!(
             app.begin_picker(Purpose::Import).units(),
             0,
@@ -336,7 +351,7 @@ mod tests {
         let second = app.picker_pending.unwrap().id;
         app.finish_picker(first, Ok(Some(PathBuf::from("duplicate.csv"))));
         assert_eq!(app.picker_pending.unwrap().id, second);
-        let _ = app.update(Message::PlatformSecurity(SecurityEvent::SessionLocked));
+        let _ = app.test_update(Message::PlatformSecurity(SecurityEvent::SessionLocked));
         app.finish_picker(second, Ok(Some(PathBuf::from("locked.csv"))));
         assert!(app.session.is_none());
         assert!(app.picker_pending.is_none());
@@ -380,7 +395,7 @@ mod tests {
         app.master_password = "synthetic-only".into();
         app.confirm_password = app.master_password.clone();
         let _ = app.begin_picker(Purpose::CreateVault);
-        let _ = app.update(Message::CreateVault);
+        let _ = app.test_update(Message::CreateVault);
         assert!(
             app.session.is_none(),
             "pending dialog must not create a vault"
@@ -407,17 +422,18 @@ mod recovery_tests {
     fn recovery_dialog_results_cannot_cross_close_reopen_or_lock() {
         for lock in [false, true] {
             let (_dir, mut app) = crate::app::tests::fixture(0);
-            app.lock_with_status("synthetic");
-            app.open_recovery();
+            app.test_lock_with_status("synthetic");
+            app.test_open_recovery();
             let _ = app.begin_picker(Purpose::RecoverySource);
             let pending = app.picker_pending.unwrap();
             if lock {
-                app.lock_with_status("synthetic");
+                app.test_lock_with_status("synthetic");
             } else {
                 app.dismiss_recovery();
             }
-            app.open_recovery();
+            app.test_open_recovery();
             app.finish_picker(pending.id, Ok(Some(PathBuf::from("stale.pmvault"))));
+            app.test_drain_pending();
             assert!(app.recovery.as_ref().unwrap().source.is_empty());
             assert!(app.picker_pending.is_none());
             let _ = app.begin_picker(Purpose::RecoveryDestination);

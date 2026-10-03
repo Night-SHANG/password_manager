@@ -8,21 +8,29 @@ use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::domain::EntryRecord;
-use crate::export::{PlaintextExportAcknowledgement, export_plaintext_csv};
-use crate::import::plan::{
-    ConflictResolution, ImportApplyOptions, ImportClass, ImportPreview, apply_preview,
-    build_preview,
-};
-use crate::import::stage_path;
+use crate::export::PlaintextExportAcknowledgement;
+use crate::import::plan::{ConflictResolution, ImportApplyOptions, ImportClass, ImportPreview};
 use crate::platform::{self, SecurityEvent};
-use crate::services::{PasswordGeneratorOptions, draft, generate_password, safe_web_url};
+use crate::services::{PasswordGeneratorOptions, generate_password, safe_web_url};
 use crate::storage::VaultSession;
 use crate::{AppError, Result};
 
 mod actions;
+#[cfg(test)]
+mod background_perf_tests;
 mod export_notice;
+#[cfg(test)]
+mod import_operation_tests;
+#[cfg(test)]
+mod operation_tests;
+mod operations;
+mod pagination;
 mod picker;
+pub(crate) mod view_index;
+use pagination::PageTarget;
 mod recovery;
+#[cfg(test)]
+mod retirement_tests;
 mod safety;
 #[cfg(test)]
 mod tests;
@@ -50,6 +58,7 @@ pub fn run() -> iced::Result {
 }
 
 struct App {
+    operations: operations::UiOperations,
     closing: bool,
     export_notice: Option<export_notice::ExportNotice>,
     export_notice_generation: u64,
@@ -78,6 +87,11 @@ struct App {
     category_editor_open: bool,
     session: Option<VaultSession>,
     search: String,
+    view_index: Option<view_index::ViewIndex>,
+    filtered_entries: Option<Vec<usize>>,
+    category_page: usize,
+    card_page: usize,
+    import_page: usize,
     search_id: widget::Id,
     nav: NavFilter,
     selected: Option<Uuid>,
@@ -105,7 +119,7 @@ enum NavFilter {
 enum Panel {
     Vault,
     Editor(EditorState),
-    Import(ImportState),
+    Import(Box<ImportState>),
     Settings(SettingsState),
     DeleteEntry(Uuid),
     DeleteCategory(String),
@@ -156,6 +170,8 @@ struct ImportState {
     preview: Option<ImportPreview>,
     apply_updates: bool,
     resolutions: BTreeMap<usize, ConflictResolution>,
+    candidate_pages: BTreeMap<usize, usize>,
+    candidate_focus: Option<usize>,
 }
 
 impl ImportState {
@@ -166,6 +182,8 @@ impl ImportState {
             preview: None,
             apply_updates: true,
             resolutions: BTreeMap::new(),
+            candidate_pages: BTreeMap::new(),
+            candidate_focus: None,
         }
     }
 }
@@ -251,6 +269,9 @@ struct PendingEditorCut {
 
 #[derive(Clone)]
 enum Message {
+    Ui(crate::operations::ContextStamp, Box<Message>),
+    OperationSignal(crate::operations::OperationSignal),
+    ClipboardShutdownFinished(iced::window::Id, bool),
     AcknowledgeClipboardCleanup(u64),
     SecurityTick(std::time::Instant),
     UserActivity(std::time::Instant),
@@ -279,6 +300,10 @@ enum Message {
     Lock,
     FocusSearch,
     SearchChanged(String),
+    SetCardPage(usize),
+    NavigatePage(PageTarget, bool),
+    SetImportPage(Uuid, usize),
+    SetImportCandidatePage(Uuid, usize, usize),
     SetNav(NavFilter),
     SelectEntry(Uuid),
     EditEntry(Uuid),
@@ -353,6 +378,7 @@ impl std::fmt::Debug for Message {
 impl App {
     fn initial() -> Self {
         Self {
+            operations: operations::UiOperations::new(),
             closing: false,
             export_notice: None,
             export_notice_generation: 0,
@@ -381,6 +407,11 @@ impl App {
             category_editor_open: false,
             session: None,
             search: String::new(),
+            view_index: None,
+            filtered_entries: None,
+            category_page: 0,
+            card_page: 0,
+            import_page: 0,
             search_id: widget::Id::unique(),
             nav: NavFilter::All,
             selected: None,
@@ -410,11 +441,27 @@ impl App {
             }
             Err(warning) => app.status = warning,
         }
-        app.check_startup_recovery();
+        match platform::register_operation_authority(std::sync::Arc::downgrade(
+            &app.operations.authority,
+        )) {
+            Ok(registration) => app.operations.registration = Some(registration),
+            Err(_) => {
+                app.operations.authority.revoke(
+                    crate::operations::RevokeReason::MonitorFailed,
+                    std::time::Instant::now(),
+                );
+                app.status = "安全监控注册失败，保持锁定".into();
+            }
+        }
+        app.start_inspection(false);
+        let inspection = app.operations.task.take().unwrap_or_else(Task::none);
         (
             app,
-            platform::set_screen_capture_protection(true)
-                .map(Message::ScreenCaptureProtectionApplied),
+            Task::batch([
+                inspection,
+                platform::set_screen_capture_protection(true)
+                    .map(Message::ScreenCaptureProtectionApplied),
+            ]),
         )
     }
 
@@ -444,6 +491,32 @@ impl App {
             if key == keyboard::Key::Named(keyboard::key::Named::Escape) {
                 return Some(Message::CloseContext);
             }
+            if let keyboard::Key::Named(named) = &key {
+                use keyboard::key::Named;
+                if matches!(named, Named::PageUp | Named::PageDown) {
+                    let target = if modifiers.command() && modifiers.shift() {
+                        Some(PageTarget::Candidates)
+                    } else if modifiers.command() {
+                        Some(PageTarget::Primary)
+                    } else if modifiers.alt() {
+                        Some(PageTarget::Categories)
+                    } else {
+                        None
+                    };
+                    if let Some(target) = target {
+                        return Some(Message::NavigatePage(target, *named == Named::PageDown));
+                    }
+                }
+                if modifiers.command()
+                    && modifiers.shift()
+                    && matches!(named, Named::ArrowUp | Named::ArrowDown)
+                {
+                    return Some(Message::NavigatePage(
+                        PageTarget::DecisionFocus,
+                        *named == Named::ArrowDown,
+                    ));
+                }
+            }
             if !modifiers.command() {
                 return None;
             }
@@ -463,11 +536,26 @@ impl App {
                 _ => None,
             }
         });
+        let stamp = self
+            .operations
+            .authority
+            .snapshot(std::time::Instant::now())
+            .stamp;
+        let hotkeys = hotkeys.with(stamp).map(|(stamp, message)| {
+            if matches!(message, Message::Lock) {
+                message
+            } else {
+                Message::Ui(stamp, Box::new(message))
+            }
+        });
         Subscription::batch([
             hotkeys,
             iced::event::listen_with(safety::runtime_event),
-            if self.session.is_some() {
-                iced::time::every(std::time::Duration::from_secs(1)).map(Message::SecurityTick)
+            if self.session.is_some()
+                || self.operation_busy()
+                || matches!(self.operations.session, operations::SessionUi::Locking)
+            {
+                iced::time::every(std::time::Duration::from_millis(100)).map(Message::SecurityTick)
             } else {
                 Subscription::none()
             },
@@ -476,13 +564,72 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let message = if let Message::Ui(stamp, message) = message {
+            let current = self
+                .operations
+                .authority
+                .snapshot(std::time::Instant::now())
+                .stamp;
+            let edit = operations::form_edit(&message);
+            let same_render_edit = edit
+                && !self.operation_busy()
+                && self.operations.edit_stamp == Some(stamp)
+                && stamp.epoch == current.epoch
+                && stamp.display == current.display;
+            if stamp != current && !same_render_edit && !matches!(*message, Message::Lock) {
+                return Task::none();
+            }
+            if edit && !self.operation_busy() && stamp == current {
+                self.operations.edit_stamp = Some(stamp);
+                self.operations.authority.change_form();
+            }
+            *message
+        } else {
+            message
+        };
         self.security_tick(std::time::Instant::now());
-        // Iced processes a message batch before executing window actions. Once
-        // final close is admitted, no later message may unlock or start work.
-        if self.closing
+        self.refresh_operation_drain();
+        if let Message::OperationSignal(signal) = message {
+            self.finish_operation_signal(signal);
+            return self.operations.task.take().unwrap_or_else(Task::none);
+        }
+        if self.operation_busy()
             && !matches!(
                 &message,
-                Message::PlatformSecurity(_)
+                Message::Lock
+                    | Message::CloseRequested(_)
+                    | Message::KeepOpen(_)
+                    | Message::ConfirmExportExit(_, _)
+                    | Message::CancelPanel
+                    | Message::CloseContext
+                    | Message::PlatformSecurity(_)
+                    | Message::SecurityTick(_)
+                    | Message::UserActivity(_)
+                    | Message::WindowFocusChanged(_)
+                    | Message::PathPicked(_, _)
+                    | Message::ScreenCaptureProtectionApplied(_)
+                    | Message::AcknowledgeClipboardCleanup(_)
+            )
+        {
+            // An already queued edit cancels preparation. Repeated submissions
+            // merely fail admission and cannot start another KDF or write.
+            if operations::form_edit(&message) {
+                self.operations.edit_stamp = None;
+                self.operations.authority.change_form();
+            }
+
+            return self.operations.task.take().unwrap_or_else(Task::none);
+        }
+        // Iced processes a message batch before executing window actions. Once
+        // final close is admitted, no later message may unlock or start work.
+        if (self.closing || self.operations.close_window.is_some())
+            && !matches!(
+                &message,
+                Message::ClipboardShutdownFinished(_, _)
+                    | Message::CloseRequested(_)
+                    | Message::KeepOpen(_)
+                    | Message::ConfirmExportExit(_, _)
+                    | Message::PlatformSecurity(_)
                     | Message::SecurityTick(_)
                     | Message::WindowFocusChanged(_)
                     | Message::PathPicked(_, _)
@@ -526,6 +673,22 @@ impl App {
             )
         {
             return Task::none();
+        }
+        if matches!(
+            &message,
+            Message::AuthMode(_)
+                | Message::ToggleAuthOptions
+                | Message::OpenRecovery
+                | Message::CloseRecovery(_)
+                | Message::OpenImport
+                | Message::OpenSettings
+                | Message::NewEntry
+                | Message::EditEntry(_)
+                | Message::EditSelected
+                | Message::CancelPanel
+        ) {
+            self.operations.edit_stamp = None;
+            self.operations.authority.change_form();
         }
         // Invalidate, but retain the in-flight slot until the OS dialog returns.
         // This rejects stale results while preventing multiple native dialogs.
@@ -576,6 +739,10 @@ impl App {
             return Task::none();
         }
         match message {
+            Message::Ui(_, _) | Message::OperationSignal(_) => return Task::none(),
+            Message::ClipboardShutdownFinished(window, ok) => {
+                return self.finish_clipboard_shutdown(window, ok);
+            }
             Message::AcknowledgeExportNotice(generation) => self.acknowledge_export(generation),
             Message::CloseRequested(window) => return self.request_close(window),
             Message::KeepOpen(request) => self.keep_open(request),
@@ -687,20 +854,68 @@ impl App {
             Message::CreateVault => self.create_vault(),
             Message::OpenVault => self.open_vault(),
             Message::Save => self.save_now(),
-            Message::Lock => self.lock_with_status("保险库已锁定"),
+            Message::Lock => self.lock_with_status("正在锁定保险库"),
             Message::FocusSearch => {
                 if self.session.is_some() && matches!(&self.panel, Panel::Vault) {
                     return operation::focus(self.search_id.clone());
                 }
             }
+            Message::SetCardPage(page) => {
+                if self.session.is_some() && matches!(self.panel, Panel::Vault) {
+                    self.card_page = page;
+                    self.close_context();
+                    self.selected = None;
+                    self.clamp_view_pages();
+                }
+            }
+            Message::NavigatePage(target, forward) => self.navigate_page(target, forward),
+            Message::SetImportPage(id, page) => {
+                if matches!(&self.panel,Panel::Import(s) if s.preview.as_ref().is_some_and(|p|p.id()==id))
+                {
+                    self.import_page = page;
+                    if let Panel::Import(state) = &mut self.panel {
+                        state.candidate_focus = None;
+                    }
+                    self.clamp_view_pages();
+                }
+            }
+            Message::SetImportCandidatePage(id, row, page) => {
+                if let Panel::Import(state) = &mut self.panel
+                    && state.preview.as_ref().is_some_and(|p| {
+                        p.id() == id
+                            && p.rows().get(row).is_some_and(|r| {
+                                matches!(
+                                    r.class(),
+                                    ImportClass::Conflict { .. }
+                                        | ImportClass::LocallyDeleted { .. }
+                                )
+                            })
+                    })
+                {
+                    state.candidate_pages.insert(row, page);
+                    state.candidate_focus = Some(row);
+                }
+            }
             Message::SearchChanged(value) => {
+                self.card_page = 0;
                 self.search = value;
+                self.filtered_entries = self
+                    .view_index
+                    .as_ref()
+                    .filter(|_| !self.search.is_empty())
+                    .map(|i| i.filter(&self.nav, &self.search));
                 self.close_context();
             }
             Message::SetNav(nav) => {
+                self.card_page = 0;
                 self.nav = nav;
+                self.filtered_entries = self
+                    .view_index
+                    .as_ref()
+                    .filter(|_| !self.search.is_empty())
+                    .map(|i| i.filter(&self.nav, &self.search));
                 self.selected = None;
-                self.panel = Panel::Vault;
+                self.retire_current_panel();
                 self.close_context();
             }
             Message::SelectEntry(id) => {
@@ -748,9 +963,15 @@ impl App {
                     ContextActionKind::Close => Message::CloseContext,
                 });
             }
-            Message::CloseContext => self.close_context(),
+            Message::CloseContext => {
+                if self.operation_busy() {
+                    self.cancel_operation();
+                }
+                self.close_context();
+            }
             Message::NewEntry => {
                 if self.session.is_some() && !matches!(&self.panel, Panel::Editor(_)) {
+                    self.retire_current_panel();
                     self.panel = Panel::Editor(EditorState::new());
                     self.close_context();
                 }
@@ -839,7 +1060,8 @@ impl App {
             }
             Message::SaveEditor => self.save_editor(),
             Message::CancelPanel => {
-                self.panel = Panel::Vault;
+                self.cancel_operation();
+                self.retire_current_panel();
                 self.close_context();
             }
             Message::ToggleReveal => self.toggle_reveal(),
@@ -898,23 +1120,30 @@ impl App {
             Message::MoveCategory(name, up) => self.move_category(&name, up),
             Message::RequestDeleteCategory(name) => {
                 self.close_context();
+                self.retire_current_panel();
                 self.panel = Panel::DeleteCategory(name);
             }
             Message::ConfirmDeleteCategory(name) => self.delete_category(&name),
             Message::OpenImport => {
                 if self.session.is_some() {
                     self.close_context();
-                    self.panel = Panel::Import(ImportState::new());
+                    self.retire_current_panel();
+                    self.panel = Panel::Import(Box::new(ImportState::new()));
                 }
             }
             Message::ImportPathChanged(value) => {
                 if let Panel::Import(s) = &mut self.panel {
                     s.path = value;
-                    s.preview = None;
+                    let mut retired = crate::operations::RetiredUi {
+                        preview: s.preview.take(),
+                        ..crate::operations::RetiredUi::default()
+                    };
+                    retired.passwords[3] = Some(zeroize::Zeroizing::new(std::mem::take(
+                        &mut s.legacy_password,
+                    )));
                     s.resolutions.clear();
                     s.apply_updates = true;
-                    s.legacy_password.zeroize();
-                    s.legacy_password.clear();
+                    self.retire_operation_ui(retired);
                 }
             }
             Message::ImportLegacyPasswordChanged(value) => {
@@ -942,7 +1171,9 @@ impl App {
             Message::ApplyImport(preview_id) => self.apply_import(preview_id),
             Message::OpenSettings => {
                 if let Some(session) = &self.session {
-                    self.panel = Panel::Settings(SettingsState::from_vault(session));
+                    let settings = SettingsState::from_vault(session);
+                    self.retire_current_panel();
+                    self.panel = Panel::Settings(settings);
                     self.close_context();
                 }
             }
@@ -1040,6 +1271,16 @@ impl App {
                     }
                 }
                 SecurityEvent::MonitorReady => {
+                    // Native readiness was decided synchronously by the bound
+                    // monitor token. A delayed UI Ready cannot revive authority.
+                    if !self
+                        .operations
+                        .authority
+                        .snapshot(std::time::Instant::now())
+                        .monitor_ready
+                    {
+                        return self.operations.task.take().unwrap_or_else(Task::none);
+                    }
                     if self.security_monitor_failed {
                         self.status = "Windows 会话监控已恢复，请重新解锁".into();
                     }
@@ -1056,14 +1297,18 @@ impl App {
                     self.security_monitor_ready = false;
                     self.security_monitor_failed = true;
                     self.lock_with_status(
-                        "Windows 会话监控初始化失败或已中断，保险库保持锁定；请重启软件后重试",
+                        "Windows 会话监控初始化失败或已中断，正在锁定；请重启软件后重试",
                     );
                 }
-                SecurityEvent::SessionLocked => self.lock_with_status("Windows 锁屏，保险库已锁定"),
-                SecurityEvent::SessionLoggedOff => {
-                    self.lock_with_status("Windows 注销，保险库已锁定")
+                SecurityEvent::SessionLocked => {
+                    self.lock_with_status("Windows 锁屏，正在锁定保险库")
                 }
-                SecurityEvent::SystemSuspending => self.lock_with_status("系统挂起，保险库已锁定"),
+                SecurityEvent::SessionLoggedOff => {
+                    self.lock_with_status("Windows 注销，正在锁定保险库")
+                }
+                SecurityEvent::SystemSuspending => {
+                    self.lock_with_status("系统挂起，正在锁定保险库")
+                }
                 SecurityEvent::ClipboardCleanupFailed => {
                     self.note_clipboard_cleanup_failure();
                 }
@@ -1077,7 +1322,8 @@ impl App {
         {
             self.status = format!("{}；{}", self.status, warning);
         }
-        Task::none()
+        self.advance_close();
+        self.operations.task.take().unwrap_or_else(Task::none)
     }
 }
 
@@ -1090,10 +1336,16 @@ impl Drop for App {
     fn drop(&mut self) {
         // Lock may already have relinquished the live token. The process-local
         // barrier also covers that retired receipt and queued cleanup.
-        if platform::shutdown_clipboard().is_err() {
-            eprintln!("clipboard_cleanup_incomplete_on_exit");
+        self.operations.authority.revoke(
+            crate::operations::RevokeReason::Close,
+            std::time::Instant::now(),
+        );
+        if !self.closing {
+            self.mask_for_operation_lock("正在退出", false);
         }
-        self.clear_password_fields();
+        if let Some(service) = &self.operations.service {
+            service.request_shutdown();
+        }
     }
 }
 

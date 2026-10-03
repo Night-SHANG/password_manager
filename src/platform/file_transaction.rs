@@ -8,7 +8,7 @@ use std::path::Path;
 #[path = "windows_transaction.rs"]
 mod native;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct Identity {
     pub volume: u64,
     pub file: u64,

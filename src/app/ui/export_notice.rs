@@ -87,6 +87,40 @@ impl App {
     }
 
     pub(in crate::app) fn view(&self) -> Element<'_, Message> {
+        if let Some(service) = &self.operations.service {
+            let _ = service.drain_snapshot();
+        }
+        let stamp = self
+            .operations
+            .authority
+            .snapshot(std::time::Instant::now())
+            .stamp;
+        self.view_inner()
+            .map(move |message| Message::Ui(stamp, Box::new(message)))
+    }
+    fn view_inner(&self) -> Element<'_, Message> {
+        let base = self.view_content();
+        if self.operations.failure_notice.is_none() {
+            return base;
+        }
+        column![
+            container(
+                text(
+                    self.operations
+                        .failure_notice
+                        .as_deref()
+                        .unwrap_or_default()
+                )
+                .wrapping(text::Wrapping::WordOrGlyph)
+            )
+            .padding(12),
+            base
+        ]
+        .height(Length::Fill)
+        .width(Length::Fill)
+        .into()
+    }
+    fn view_content(&self) -> Element<'_, Message> {
         if self.export_close_prompt.is_some() {
             return container(
                 column![self.export_warning(true), self.clipboard_warning()]

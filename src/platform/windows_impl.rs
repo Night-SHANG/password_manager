@@ -25,12 +25,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, w};
 
 use super::clipboard::{ClipboardCommand, ClipboardEngine, ClipboardQueue, CopyCommand};
-use super::security_monitor::{MAX_STARTUP_ATTEMPTS, claim_monitor, retry_startup};
+use super::operation_authority::{MonitorAuthorityToken, process_registry};
+use super::security_monitor::{
+    MAX_STARTUP_ATTEMPTS, MonitorAuthorityGuard, MonitorFailure, claim_monitor, retry_startup,
+};
 use super::windows_clipboard::{CLIPBOARD_TIMER_ID, WindowsClipboard};
 use super::{ClipboardKind, ClipboardSession, SecurityEvent};
 use crate::{AppError, Result};
 
 const CLIPBOARD_WAKE_MESSAGE: u32 = WM_APP + 0x31;
+const MONITOR_STOP_MESSAGE: u32 = WM_APP + 0x32;
 const SHUTDOWN_WAIT_MS: u64 = 300;
 
 static MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
@@ -40,6 +44,7 @@ static CLIPBOARD_QUEUE: OnceLock<Mutex<ClipboardQueue>> = OnceLock::new();
 thread_local! {
     static STOPPING_WINDOW: Cell<bool> = const {Cell::new(false)};
     static FAILURE_SENT: Cell<bool> = const {Cell::new(false)};
+    static NATIVE_MONITOR_AUTHORITY: RefCell<Option<MonitorAuthorityToken>> = const { RefCell::new(None) };
     static EVENT_SENDER: RefCell<Option<UnboundedSender<SecurityEvent>>> = const { RefCell::new(None) };
     static CLIPBOARD_ENGINE: RefCell<Option<ClipboardEngine<WindowsClipboard>>> = const { RefCell::new(None) };
     static CURRENT_WRITER: RefCell<Option<ClipboardSession>> = const { RefCell::new(None) };
@@ -81,46 +86,87 @@ pub fn security_events() -> Subscription<SecurityEvent> {
 
 fn security_event_stream() -> impl iced::futures::Stream<Item = SecurityEvent> {
     stream::channel(32, async |mut output| {
-        // A failed runtime owner requires a fresh process. A second subscription
-        // must not create another monitor while a previous owner is still alive.
+        // Capture registration exactly once. A native monitor or its forwarder
+        // never resolves whichever App happens to be registered later.
+        let Some(token) = process_registry().capture_monitor() else {
+            let _ = output.send(SecurityEvent::MonitorFailed).await;
+            return;
+        };
+        let _forwarding_guard = MonitorAuthorityGuard::new(
+            token.clone(),
+            MonitorFailure::ForwardingClosed,
+            request_monitor_stop,
+        );
         if !claim_monitor(&MONITOR_STARTED) {
+            MonitorFailure::DuplicateOwner.revoke_in(&token, Instant::now());
             let _ = output.send(SecurityEvent::MonitorFailed).await;
             return;
         }
         let (sender, mut receiver) = mpsc::unbounded();
         let thread_sender = sender.clone();
+        let thread_token = token.clone();
 
         let spawn_result = std::thread::Builder::new()
             .name("password-manager-win-events".to_string())
             .spawn(move || {
+                NATIVE_MONITOR_AUTHORITY
+                    .with(|slot| *slot.borrow_mut() = Some(thread_token.clone()));
+                let _native_exit = MonitorAuthorityGuard::new(
+                    thread_token.clone(),
+                    MonitorFailure::RuntimeExit,
+                    || {
+                        SECURITY_WINDOW.store(0, Ordering::Release);
+                        clipboard_queue().revoke_active_native();
+                    },
+                );
                 for attempt in 1..=MAX_STARTUP_ATTEMPTS {
                     let mut reached_ready = false;
                     let mut cleanup_complete = true;
                     FAILURE_SENT.with(|slot| slot.set(false));
-                    let _ = run_security_window(
+                    let result = run_security_window(
                         thread_sender.clone(),
                         &mut reached_ready,
                         &mut cleanup_complete,
                     );
-                    SECURITY_WINDOW.store(0, Ordering::Release);
-                    clipboard_queue().revoke_active_native();
-                    if retry_startup(
+                    // Classify only at the completed attempt boundary. Before
+                    // first Ready there is no auth authority; a torn-down init
+                    // failure can retain its single initial Ready grant only
+                    // when both structural policy and coordinator agree.
+                    let eligible_retry = retry_startup(
                         attempt,
                         reached_ready,
                         cleanup_complete,
                         !thread_sender.is_closed(),
-                    ) {
+                    );
+                    if eligible_retry
+                        && MonitorFailure::StartupRetry.revoke_in(&thread_token, Instant::now())
+                    {
+                        SECURITY_WINDOW.store(0, Ordering::Release);
+                        clipboard_queue().revoke_active_native();
                         std::thread::sleep(Duration::from_millis(u64::from(attempt) * 250));
                         continue;
                     }
-                    if !FAILURE_SENT.with(Cell::get) {
-                        let _ = thread_sender.unbounded_send(SecurityEvent::MonitorFailed);
+                    let failure = if result.is_err() && !reached_ready {
+                        MonitorFailure::Initialization
+                    } else {
+                        MonitorFailure::RuntimeExit
+                    };
+                    failure.revoke_in(&thread_token, Instant::now());
+                    SECURITY_WINDOW.store(0, Ordering::Release);
+                    clipboard_queue().revoke_active_native();
+                    if !FAILURE_SENT.with(Cell::get)
+                        && thread_sender
+                            .unbounded_send(SecurityEvent::MonitorFailed)
+                            .is_err()
+                    {
+                        MonitorFailure::EventSend.revoke_in(&thread_token, Instant::now());
                     }
                     break;
                 }
             });
 
         if spawn_result.is_err() {
+            MonitorFailure::Spawn.revoke_in(&token, Instant::now());
             MONITOR_STARTED.store(false, Ordering::Release);
             let _ = output.send(SecurityEvent::MonitorFailed).await;
             return;
@@ -129,10 +175,49 @@ fn security_event_stream() -> impl iced::futures::Stream<Item = SecurityEvent> {
         drop(sender);
         while let Some(event) = receiver.next().await {
             if output.send(event).await.is_err() {
+                MonitorFailure::ForwardingClosed.revoke_in(&token, Instant::now());
                 break;
             }
         }
+        MonitorFailure::ForwardingClosed.revoke_in(&token, Instant::now());
     })
+}
+
+fn native_authority_token() -> Option<MonitorAuthorityToken> {
+    NATIVE_MONITOR_AUTHORITY.with(|slot| slot.borrow().clone())
+}
+
+fn route_native_security_event(event: SecurityEvent) -> bool {
+    // Release the TLS borrow before metadata-coordinator entry; a native call
+    // never reads the process registry again after the monitor starts.
+    native_authority_token().is_some_and(|token| token.route(event, Instant::now()))
+}
+
+fn fail_native_monitor(failure: MonitorFailure) {
+    if let Some(token) = native_authority_token() {
+        failure.revoke_in(&token, Instant::now());
+    }
+}
+
+fn request_monitor_stop() {
+    let raw = SECURITY_WINDOW.load(Ordering::Acquire);
+    clipboard_queue().revoke_active_native();
+    if raw != 0 {
+        // This runs on the forwarding executor, not the native window thread.
+        // PostQuitMessage would target the wrong thread; a metadata-only window
+        // message asks the owner to exit without waiting for it here.
+        let posted = unsafe {
+            PostMessageW(
+                Some(HWND(raw as *mut c_void)),
+                MONITOR_STOP_MESSAGE,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
+        if posted.is_err() {
+            SECURITY_WINDOW.store(0, Ordering::Release);
+        }
+    }
 }
 
 pub fn begin_clipboard_session() -> ClipboardSession {
@@ -268,10 +353,16 @@ fn run_security_window(
     }
 
     *cleanup_complete = false;
-    let result = run_registered_security_window(HINSTANCE(module.0), class_name, reached_ready);
+    let mut native_cleanup_complete = true;
+    let result = run_registered_security_window(
+        HINSTANCE(module.0),
+        class_name,
+        reached_ready,
+        &mut native_cleanup_complete,
+    );
     let unregistered = unsafe { UnregisterClassW(class_name, Some(HINSTANCE(module.0))) }
         .map_err(|error| platform_error("UnregisterClassW", error));
-    *cleanup_complete = unregistered.is_ok();
+    *cleanup_complete = native_cleanup_complete && unregistered.is_ok();
     result.and(unregistered)
 }
 
@@ -279,6 +370,7 @@ fn run_registered_security_window(
     instance: HINSTANCE,
     class_name: PCWSTR,
     reached_ready: &mut bool,
+    native_cleanup_complete: &mut bool,
 ) -> Result<()> {
     let hwnd = unsafe {
         CreateWindowExW(
@@ -298,17 +390,17 @@ fn run_registered_security_window(
         .map_err(|error| platform_error("CreateWindowExW", error))?
     };
 
+    *native_cleanup_complete = false;
     if let Err(error) = unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } {
-        destroy_security_window(hwnd);
+        *native_cleanup_complete = destroy_security_window(hwnd);
         return Err(platform_error("WTSRegisterSessionNotification", error));
     }
     let backend = match WindowsClipboard::new(hwnd) {
         Ok(backend) => backend,
         Err(error) => {
-            unsafe {
-                let _ = WTSUnRegisterSessionNotification(hwnd);
-                destroy_security_window(hwnd);
-            }
+            let unregistered = unsafe { WTSUnRegisterSessionNotification(hwnd) }.is_ok();
+            let destroyed = destroy_security_window(hwnd);
+            *native_cleanup_complete = unregistered && destroyed;
             return Err(error);
         }
     };
@@ -316,14 +408,19 @@ fn run_registered_security_window(
 
     *reached_ready = true;
     SECURITY_WINDOW.store(hwnd.0 as isize, Ordering::Release);
-    send_event(SecurityEvent::MonitorReady);
+    if !send_event(SecurityEvent::MonitorReady) {
+        *native_cleanup_complete = stop_security_window(hwnd);
+        return Err(AppError::Platform(
+            "Windows monitor readiness could not reach a live authority".to_string(),
+        ));
+    }
 
     let mut message = windows::Win32::UI::WindowsAndMessaging::MSG::default();
     loop {
         let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
         if result.0 == -1 {
             let error = platform_error("GetMessageW", std::io::Error::last_os_error());
-            stop_security_window(hwnd);
+            *native_cleanup_complete = stop_security_window(hwnd);
             return Err(error);
         }
         if result.0 == 0 {
@@ -336,11 +433,12 @@ fn run_registered_security_window(
         }
     }
 
-    stop_security_window(hwnd);
+    *native_cleanup_complete = stop_security_window(hwnd);
     Ok(())
 }
 
-fn stop_security_window(hwnd: HWND) {
+fn stop_security_window(hwnd: HWND) -> bool {
+    fail_native_monitor(MonitorFailure::RuntimeExit);
     SECURITY_WINDOW.store(0, Ordering::Release);
     clipboard_queue().revoke_active();
     with_engine(|engine| {
@@ -348,16 +446,16 @@ fn stop_security_window(hwnd: HWND) {
     });
     let engine = CLIPBOARD_ENGINE.with(|slot| slot.borrow_mut().take());
     drop(engine); // Native Drop calls must run after releasing the RefCell borrow.
-    unsafe {
-        let _ = WTSUnRegisterSessionNotification(hwnd);
-        destroy_security_window(hwnd);
-    }
+    let unregistered = unsafe { WTSUnRegisterSessionNotification(hwnd) }.is_ok();
+    let destroyed = destroy_security_window(hwnd);
+    unregistered && destroyed
 }
 
-fn destroy_security_window(hwnd: HWND) {
+fn destroy_security_window(hwnd: HWND) -> bool {
     STOPPING_WINDOW.with(|slot| slot.set(true));
-    let _ = unsafe { DestroyWindow(hwnd) };
+    let destroyed = unsafe { DestroyWindow(hwnd) }.is_ok();
     STOPPING_WINDOW.with(|slot| slot.set(false));
+    destroyed
 }
 
 fn with_engine(operation: impl FnOnce(&mut ClipboardEngine<WindowsClipboard>)) {
@@ -385,6 +483,9 @@ fn with_engine(operation: impl FnOnce(&mut ClipboardEngine<WindowsClipboard>)) {
     let events = engine.events();
     let failed = events.contains(&SecurityEvent::MonitorFailed)
         || lifecycle.contains(&SecurityEvent::MonitorFailed);
+    if failed {
+        fail_native_monitor(MonitorFailure::RuntimeExit);
+    }
     CLIPBOARD_ENGINE.with(|slot| *slot.borrow_mut() = Some(engine));
     for event in events
         .into_iter()
@@ -408,6 +509,7 @@ fn with_engine(operation: impl FnOnce(&mut ClipboardEngine<WindowsClipboard>)) {
         // A reentrant wake may have arrived while the owner was busy. Re-post
         // after restoring it so no typed command loses its only wake-up.
         if !post_clipboard_wake(hwnd) {
+            fail_native_monitor(MonitorFailure::EventSend);
             SECURITY_WINDOW.store(0, Ordering::Release);
             clipboard_queue().revoke_active_native();
             send_event(SecurityEvent::MonitorFailed);
@@ -448,6 +550,10 @@ fn process_clipboard_queue() {
 }
 
 fn native_security_event(event: SecurityEvent) {
+    route_native_security_event(event);
+    // Coordinator routing is metadata-only and precedes every new clipboard
+    // lock/borrow. During inherited SetClipboardData reentrancy the write gate
+    // may be held by the caller, but there is no coordinator-to-clipboard edge.
     // A reentrant native event must never wait on the same write gate or on a
     // queue mutex whose caller may be waiting for that gate. Atomically revoke
     // the in-flight writer now; the owner revokes all queued permits and cleans
@@ -486,6 +592,11 @@ unsafe extern "system" fn security_wndproc(
             native_security_event(SecurityEvent::SystemSuspending);
             return LRESULT(1);
         }
+        MONITOR_STOP_MESSAGE => {
+            native_security_event(SecurityEvent::MonitorFailed);
+            unsafe { PostQuitMessage(0) };
+            return LRESULT(0);
+        }
         CLIPBOARD_WAKE_MESSAGE => {
             process_clipboard_queue();
             return LRESULT(0);
@@ -513,7 +624,23 @@ unsafe extern "system" fn security_wndproc(
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
-fn send_event(event: SecurityEvent) {
+fn send_event(event: SecurityEvent) -> bool {
+    // Monitor status can originate outside native_security_event. Revoke (or
+    // mark fresh readiness) before any channel/clipboard handling. The bridge
+    // refuses Ready if its Weak registration is absent, expired or poisoned.
+    if matches!(
+        event,
+        SecurityEvent::MonitorReady | SecurityEvent::MonitorFailed
+    ) {
+        let routed = route_native_security_event(event);
+        if event == SecurityEvent::MonitorReady && !routed {
+            fail_native_monitor(MonitorFailure::MissingAuthority);
+            SECURITY_WINDOW.store(0, Ordering::Release);
+            clipboard_queue().revoke_active_native();
+            unsafe { PostQuitMessage(1) };
+            return false;
+        }
+    }
     if event == SecurityEvent::MonitorFailed {
         FAILURE_SENT.with(|slot| slot.set(true));
     }
@@ -524,8 +651,10 @@ fn send_event(event: SecurityEvent) {
             .is_some_and(|sender| sender.unbounded_send(event).is_ok())
     });
     if !sent {
+        fail_native_monitor(MonitorFailure::EventSend);
         SECURITY_WINDOW.store(0, Ordering::Release);
         clipboard_queue().revoke_active_native();
         unsafe { PostQuitMessage(1) };
     }
+    sent
 }

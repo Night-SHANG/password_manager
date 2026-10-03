@@ -5,6 +5,7 @@ pub mod domain;
 pub mod error;
 pub mod export;
 pub mod import;
+mod operations;
 pub mod platform;
 pub mod preferences;
 pub mod security;

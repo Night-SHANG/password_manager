@@ -134,5 +134,7 @@ Linux syncs staged files and changed directories. Windows syncs supported file
 handles and does not claim a directory-flush or unsupported
 `REPLACEFILE_WRITE_THROUGH` guarantee. Windows ACL/sharing matrices, Windows 10
 22H2, physical power loss and real IME/DPI/suspend timing still need native tests.
-Crypto and storage remain synchronous in this batch; asynchronous preparation,
-commit arbitration and master-password rewrap are separate subsequent work.
+The public transaction and library APIs remain synchronous. GUI preparation,
+authority-bound commit and cleanup now run on the owned background worker; see
+[Background operations](background-operations.md). Master-password rewrap remains
+a separate subsequent group.
